@@ -903,7 +903,7 @@ cmd_backups() {
         d="${d%/}"; [ -L "$d" ] && continue; [ -f "$d/manifest.txt" ] || continue
         n=$((n+1))
         printf '  %-17s %-16s %-9s %6s  %-10s %s\n' \
-            "$(bk_field "$d" created | sed 's/T/ /;s/:[0-9]*Z$//')" \
+            "$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$(bk_field "$d" created)" +%s 2>/dev/null | xargs -I{} date -r {} '+%Y-%m-%d %H:%M' 2>/dev/null || bk_field "$d" created)" \
             "$(bk_field "$d" hostname)" "$(bk_field "$d" diskid)" \
             "$(du -sh "$d" | cut -f1)" "$(bk_field "$d" status | cut -d' ' -f1)" "$(basename "$d")"
     done
