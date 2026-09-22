@@ -660,13 +660,24 @@ ${c_bld}sdrescue fix /dev/$disk${c_off}
     want_repair=$?
     set -e
     rx 'run_fsck check' 2>&1 | grep -vE '^ +[0-9]+ ' || true
-    trap - EXIT; detach
 
     if [ "$want_repair" != 0 ]; then
+        # Clean filesystems are not the same thing as a bootable card: still
+        # check what the boot chain needs while the card is attached.
         ok "nothing to repair - both filesystems are clean"
-        [ "$do_eject" = 1 ] && { attach_none_eject "$disk"; }
+        info "boot-readiness checks"
+        local cleanrc
+        set +e; rx 'verify_boot'; cleanrc=$?; set -e
+        trap - EXIT
+        if [ "$do_eject" = 1 ]; then detach --eject; else detach; fi
+        if [ "$cleanrc" != 0 ]; then
+            warn "filesystems are clean, but the boot checks above found problems fsck cannot fix"
+            return 1
+        fi
+        ok "done - /dev/$disk is clean and looks bootable. Backup kept at: $b"
         return 0
     fi
+    trap - EXIT; detach
 
     printf '%s\n' "
 ${c_yel}Repair is needed:${c_off}
