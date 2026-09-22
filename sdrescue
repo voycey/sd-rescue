@@ -287,7 +287,7 @@ attach() {
 
 detach() {
     local do_eject=0
-    [ "${1:-}" = "--eject" ] && do_eject=1
+    [ "${1:-}" = "--eject" ] && [ "$NO_EJECT" != 1 ] && do_eject=1
     local disk; disk=$(cat "$DISKFILE" 2>/dev/null || true)
 
     if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
@@ -599,9 +599,9 @@ cmd_fix() {
     for a in "$@"; do case "$a" in
         --yes|-y)        yes=1 ;;
         --fresh-backup)  fresh=1 ;;
-        --no-eject)      do_eject=0 ;;
         *)               args+=("$a") ;;
     esac; done
+    [ "$NO_EJECT" = 1 ] && do_eject=0
     local disk; disk=$(resolve_disk "${args[0]:-}")
 
     printf '%s\n' "
@@ -789,8 +789,7 @@ sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
   $0 fix     [disk] [--yes]    the same job without the menu, for scripts,
                                re-check, eject.  This is what you usually want.
                                --yes skips the typed confirmation (for scripts),
-                               --fresh-backup re-images even if a backup exists,
-                               --no-eject leaves the card attached.
+                               --fresh-backup re-images even if a backup exists.
   $0 list                      show removable disks
   $0 info    <disk>            partition table + filesystem state (read-only)
   $0 check   <disk>            fsck in read-only mode, reports what is wrong
@@ -824,6 +823,19 @@ which is the steps below, with a repair only if the check finds something:
 USAGE
 }
 
+# --no-unmount / --no-eject: leave the card attached to macOS after every
+# command, so a sequence of steps needs no physical reinsertion between them.
+NO_EJECT="${SDRESCUE_NO_EJECT:-0}"
+_args=()
+for _a in "$@"; do
+    case "$_a" in
+        --no-unmount|--no-eject) NO_EJECT=1 ;;
+        *) _args+=("$_a") ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+unset _args _a
+
 require_tools
 case "${1:-}" in
     fix)     shift; cmd_fix "$@" ;;
@@ -838,7 +850,7 @@ case "${1:-}" in
     shell)   shift; cmd_shell "$@" ;;
     restore) shift; cmd_restore "$@" ;;
     detach)  shift; detach "$@" ;;
-    ""|--no-eject|--fresh-backup) cmd_main "$@" ;;
+    ""|--fresh-backup) cmd_main "$@" ;;
     -h|--help|help) usage ;;
     # bare "sdrescue disk6" does the sensible whole-job thing
     disk[0-9]*|/dev/disk[0-9]*|/dev/rdisk[0-9]*) cmd_main "$@" ;;

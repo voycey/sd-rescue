@@ -72,6 +72,8 @@ Individual steps, if you want them:
 | `sdrescue restore <backup-dir>` | write a backup back onto a card |
 | `sdrescue detach --eject` | tear down the export and eject the card |
 
+Add `--no-unmount` to any command to leave the card attached to macOS afterwards, so several steps can run without pulling and reinserting it.
+
 All of these take an optional disk argument (`sdrescue info disk6`) when you want to name the card yourself. It is always the whole disk, never a partition.
 
 ## Verify
