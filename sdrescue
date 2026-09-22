@@ -283,8 +283,10 @@ attach() {
         "$IMAGE" sleep infinity >/dev/null
 
     info "attaching card as $NBD_DEV inside the VM"
-    local nargs=(-N '')
-    [ "$mode" = ro ] && nargs=(-readonly -N '')
+    # -timeout: a card that stops answering (it happens: "card stuck being
+    # busy") fails its I/O after 2 minutes instead of hanging forever.
+    local nargs=(-timeout 120 -N '')
+    [ "$mode" = ro ] && nargs=(-readonly -timeout 120 -N '')
     docker exec "$CONTAINER" nbd-client "${nargs[@]}" \
         "$VM_HOST_IP" "$NBD_PORT" "$NBD_DEV" \
         || die "nbd-client could not attach the card"
