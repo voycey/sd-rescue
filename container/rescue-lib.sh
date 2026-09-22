@@ -327,3 +327,207 @@ survey() {
     done
     echo "part.count=$n"
 }
+
+# --------------------------------------------------------------- verify ------
+# Boot-readiness checks that fsck does not do. Mounts both partitions
+# read-only and inspects what the Pi's boot chain will need.
+#   verify_boot        fast checks (seconds)
+#   verify_boot deep   also checks every package file against dpkg's md5sums
+# Prints ok/warn/FAIL lines; returns 1 if anything FAILed.
+V_FAILS=0; V_WARNS=0
+v_ok()   { echo "  ok    $*"; }
+v_warn() { echo "  warn  $*"; V_WARNS=$((V_WARNS+1)); }
+v_fail() { echo "  FAIL  $*"; V_FAILS=$((V_FAILS+1)); }
+
+verify_boot() {
+    local deep="${1:-}" boot=/mnt/bootfs root=/mnt/rootfs p t bp="" rp=""
+    V_FAILS=0; V_WARNS=0
+    for p in "${NBD_DEV}"p*; do
+        [ -b "$p" ] || continue
+        t=$(fstype_of "$p")
+        is_fat "$t" && [ -z "$bp" ] && bp="$p"
+        is_ext "$t" && [ -z "$rp" ] && rp="$p"
+    done
+    [ -n "$bp" ] || { v_fail "no FAT boot partition found"; return 1; }
+    [ -n "$rp" ] || { v_fail "no ext4 root partition found"; return 1; }
+
+    mkdir -p "$boot" "$root"
+    mount -o ro "$bp" "$boot" 2>/dev/null || { v_fail "cannot mount $bp (boot)"; return 1; }
+    if ! mount -o ro "$rp" "$root" 2>/dev/null; then
+        v_fail "cannot mount $rp (root) - the kernel would fail here too"
+        umount "$boot"; return 1
+    fi
+
+    _verify_checks "$boot" "$root" "$bp" "$rp" "$deep"
+    umount "$root" "$boot" 2>/dev/null
+    echo
+    if [ "$V_FAILS" -gt 0 ]; then
+        echo "  result: $V_FAILS problem(s) that can stop the Pi booting, $V_WARNS warning(s)"
+        return 1
+    fi
+    echo "  result: no boot blockers found, $V_WARNS warning(s)"
+    return 0
+}
+
+_verify_checks() {
+    local boot="$1" root="$2" bp="$3" rp="$4" deep="$5"
+    local f k kver="" diskid="" cmdroot="" pnum
+
+    # ---- boot partition contents ----------------------------------------
+    echo "  boot partition"
+    for f in config.txt cmdline.txt; do
+        [ -s "$boot/$f" ] && v_ok "$f present" || v_fail "$f missing or empty"
+    done
+    k=""
+    for f in kernel_2712.img kernel8.img kernel7l.img kernel7.img kernel.img; do
+        [ -s "$boot/$f" ] && { k="$f"; break; }
+    done
+    [ -n "$k" ] && v_ok "kernel image: $k ($(du -h "$boot/$k" | cut -f1))" \
+                || v_fail "no kernel image (kernel_2712.img / kernel8.img / ...)"
+    ls "$boot"/bcm27*.dtb >/dev/null 2>&1 && v_ok "device tree blobs present" \
+                                          || v_fail "no bcm27*.dtb device tree files"
+    [ -d "$boot/overlays" ] && v_ok "overlays/ present" || v_warn "overlays/ missing"
+    if grep -qE '^\s*auto_initramfs\s*=\s*1' "$boot/config.txt" 2>/dev/null; then
+        ls "$boot"/initramfs* >/dev/null 2>&1 && v_ok "initramfs present (auto_initramfs=1)" \
+                                              || v_fail "auto_initramfs=1 but no initramfs file"
+    fi
+
+    # ---- root= and fstab must point at THIS card --------------------------
+    echo "  partition identity"
+    diskid=$(sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed 's/^0x//')
+    cmdroot=$(tr ' ' '\n' < "$boot/cmdline.txt" 2>/dev/null | sed -n 's/^root=//p' | head -1)
+    pnum="${rp##*p}"
+    case "$cmdroot" in
+        PARTUUID=*)
+            if [ "${cmdroot#PARTUUID=}" = "${diskid}-0${pnum}" ]; then
+                v_ok "cmdline.txt root=$cmdroot matches this card"
+            else
+                v_fail "cmdline.txt root=$cmdroot but this card's root is PARTUUID=${diskid}-0${pnum}"
+            fi ;;
+        UUID=*)
+            [ "${cmdroot#UUID=}" = "$(blkid -o value -s UUID "$rp")" ] \
+                && v_ok "cmdline.txt root=$cmdroot matches" \
+                || v_fail "cmdline.txt root=$cmdroot does not match the root filesystem UUID" ;;
+        LABEL=*)
+            [ "${cmdroot#LABEL=}" = "$(blkid -o value -s LABEL "$rp")" ] \
+                && v_ok "cmdline.txt root=$cmdroot matches" \
+                || v_fail "cmdline.txt root=$cmdroot does not match the root filesystem label" ;;
+        /dev/*) v_ok "cmdline.txt root=$cmdroot (device path, not checked)" ;;
+        "")     v_fail "cmdline.txt has no root= parameter" ;;
+        *)      v_warn "cmdline.txt root=$cmdroot (unrecognised form)" ;;
+    esac
+    if [ -s "$root/etc/fstab" ]; then
+        local line spec mp ok=1
+        while read -r spec mp _; do
+            case "$spec" in ''|'#'*) continue ;; esac
+            case "$spec" in
+                PARTUUID=*) case "${spec#PARTUUID=}" in "${diskid}-0"[0-9]) ;; *) v_fail "fstab: $spec ($mp) is not on this card"; ok=0 ;; esac ;;
+                UUID=*) [ "${spec#UUID=}" = "$(blkid -o value -s UUID "$bp")" ] || [ "${spec#UUID=}" = "$(blkid -o value -s UUID "$rp")" ] \
+                            || { v_fail "fstab: $spec ($mp) matches neither partition"; ok=0; } ;;
+            esac
+        done < "$root/etc/fstab"
+        [ "$ok" = 1 ] && v_ok "fstab entries all resolve to this card"
+    else
+        v_fail "/etc/fstab missing or empty"
+    fi
+
+    # ---- kernel <-> modules -----------------------------------------------
+    echo "  kernel and modules"
+    if [ -n "$k" ]; then
+        kver=$( (zcat "$boot/$k" 2>/dev/null || cat "$boot/$k") | grep -a -m1 -oE 'Linux version [^ ]+' | awk '{print $3}')
+        if [ -z "$kver" ]; then
+            v_warn "could not read a version string from $k"
+        elif [ -f "$root/lib/modules/$kver/modules.dep" ] || [ -f "$root/usr/lib/modules/$kver/modules.dep" ]; then
+            v_ok "kernel $kver has matching /lib/modules/$kver"
+        else
+            v_fail "kernel $kver but no /lib/modules/$kver on the root filesystem (interrupted upgrade?)"
+            ls -d "$root"/lib/modules/*/ 2>/dev/null | sed 's|.*/modules/||;s|/$||' | sed 's/^/        have: /'
+        fi
+    fi
+
+    # ---- init and essential files ----------------------------------------
+    echo "  root filesystem"
+    if [ -x "$root/usr/lib/systemd/systemd" ] || [ -x "$root/lib/systemd/systemd" ] || [ -e "$root/sbin/init" ]; then
+        v_ok "init (systemd) present"
+    else
+        v_fail "no /sbin/init or systemd binary"
+    fi
+    for f in etc/passwd etc/group etc/shadow etc/hostname etc/hosts etc/machine-id; do
+        [ -s "$root/$f" ] && continue
+        v_fail "/$f missing or empty"
+    done
+    local hk=0 hz=0
+    for f in "$root"/etc/ssh/ssh_host_*_key; do
+        [ -e "$f" ] || continue
+        hk=$((hk+1)); [ -s "$f" ] || hz=$((hz+1))
+    done
+    if [ "$hk" -eq 0 ]; then v_warn "no SSH host keys (sshd will regenerate, but known_hosts will change)"
+    elif [ "$hz" -gt 0 ]; then v_fail "$hz of $hk SSH host keys are zero-length - sshd will not start"
+    else v_ok "$hk SSH host keys intact"; fi
+
+    # macOS writes Spotlight/fsevents metadata onto any FAT volume it mounts.
+    # Harmless to the Pi, but not something to scan or mistake for damage.
+    local macjunk
+    macjunk=$(find "$boot" -maxdepth 1 \( -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.Trashes' -o -name '.DS_Store' -o -name '._*' \) 2>/dev/null | wc -l)
+    [ "$macjunk" -gt 0 ] && v_warn "macOS left $macjunk Spotlight/fsevents item(s) on the boot partition (harmless; it mounted the card)"
+
+    # Files that exist but are all NUL bytes: the classic ext4 crash artefact.
+    local nulls
+    nulls=$(find "$root/etc" "$boot" -type f -size +0 \
+                -not -path '*/.Spotlight-V100/*' -not -path '*/.fseventsd/*' -not -path '*/.Trashes/*' -not -name '._*' \
+                2>/dev/null | head -5000 | while read -r f; do
+        [ "$(head -c 4096 "$f" | tr -d '\000' | wc -c)" -eq 0 ] && { f="${f#$root}"; echo "${f#$boot/}"; }
+    done)
+    if [ -n "$nulls" ]; then
+        v_fail "$(wc -l <<<"$nulls") file(s) in /etc or boot are NUL-filled (written during the power loss):"
+        sed 's/^/        /' <<<"$nulls" | head -15
+    else
+        v_ok "no NUL-filled files in /etc or the boot partition"
+    fi
+
+    # ---- package manager state --------------------------------------------
+    echo "  packages"
+    if [ -d "$root/var/lib/dpkg/updates" ] && [ -n "$(ls -A "$root/var/lib/dpkg/updates" 2>/dev/null | grep -v '^tmp')" ]; then
+        v_fail "dpkg was interrupted mid-operation - on the Pi run: sudo dpkg --configure -a"
+    fi
+    if [ -s "$root/var/lib/dpkg/status" ]; then
+        local bad
+        bad=$(awk '/^Package:/{p=$2} /^Status:/{s=$2" "$3" "$4; if (s!="install ok installed" && s!="deinstall ok config-files" && s!="hold ok installed" && s!="purge ok not-installed") print p" ("s")"}' "$root/var/lib/dpkg/status")
+        if [ -n "$bad" ]; then
+            v_fail "$(wc -l <<<"$bad") package(s) not fully installed:"
+            sed 's/^/        /' <<<"$bad" | head -15
+        else
+            v_ok "all $(grep -c '^Package:' "$root/var/lib/dpkg/status") packages in a consistent state"
+        fi
+    else
+        v_warn "no dpkg status file (not a Debian-based OS?)"
+    fi
+
+    # ---- what fsck orphaned -------------------------------------------------
+    local lf
+    lf=$(ls -A "$root/lost+found" 2>/dev/null | wc -l)
+    if [ "$lf" -gt 0 ]; then
+        v_warn "lost+found holds $lf item(s) fsck could not place:"
+        ls -la "$root/lost+found" | tail -n +4 | awk '{print "        "$5"\t"$NF}' | head -10
+    else
+        v_ok "lost+found is empty"
+    fi
+
+    # ---- deep: every package file vs dpkg's md5sums ------------------------
+    [ "$deep" = deep ] || { echo "  (run with --deep to checksum every package file)"; return; }
+    echo "  package file checksums (this reads most of the card)"
+    local info="$root/var/lib/dpkg/info" list=/tmp/verify.md5 conf=/tmp/verify.conffiles res
+    [ -d "$info" ] || { v_warn "no dpkg info directory"; return; }
+    cat "$info"/*.conffiles 2>/dev/null | sed 's|^/||' | sort -u > "$conf"
+    cat "$info"/*.md5sums 2>/dev/null | awk 'NF==2' > "$list.all"
+    awk 'NR==FNR{c[$1]=1;next} !($2 in c)' "$conf" "$list.all" > "$list"
+    res=$(cd "$root" && md5sum -c --quiet "$list" 2>&1 | grep -vE 'WARNING' )
+    local nbad; nbad=$(printf '%s' "$res" | grep -c .)
+    if [ "$nbad" -eq 0 ]; then
+        v_ok "$(wc -l < "$list") package files match their checksums"
+    else
+        v_fail "$nbad package file(s) changed or missing:"
+        printf '%s\n' "$res" | sed 's/^/        /' | head -25
+        echo "        reinstall the owning packages on the Pi: dpkg -S <file> ; apt reinstall <pkg>"
+    fi
+}

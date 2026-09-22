@@ -187,8 +187,14 @@ cmd_list() {
 }
 
 # ------------------------------------------------------------------ attach --
-# qemu-nbd runs as root, so `kill -0` from our uid is EPERM; ask ps instead.
-nbd_pid()     { cat "$PIDFILE" 2>/dev/null; }
+# qemu-nbd runs as root: it writes its pid file 0600 (unreadable to us) and
+# `kill -0` on it is EPERM. Read the file if we can, else find it by command
+# line, and ask ps about liveness.
+nbd_pid() {
+    local p; p=$(cat "$PIDFILE" 2>/dev/null)
+    [ -n "$p" ] || p=$(pgrep -f "qemu-nbd.*--port=$NBD_PORT" | head -1)
+    printf '%s' "$p"
+}
 nbd_running() { local p; p=$(nbd_pid); [ -n "$p" ] && ps -p "$p" >/dev/null 2>&1; }
 
 attach() {
@@ -244,14 +250,6 @@ attach() {
     fi
     echo "$mode" > "$MODEFILE"
     echo "$disk" > "$DISKFILE"
-    # The daemon writes its pid file a moment after the parent returns; if it
-    # has not appeared yet, find the process by its command line instead.
-    local w
-    for w in 1 2 3 4 5 6 7 8 9 10; do
-        [ -s "$PIDFILE" ] && break
-        sleep 0.2
-    done
-    [ -s "$PIDFILE" ] || pgrep -f "^qemu-nbd .*--port=$NBD_PORT" | head -1 > "$PIDFILE" 2>/dev/null || true
 
     if ! nc -z 127.0.0.1 "$NBD_PORT" 2>/dev/null; then
         warn "qemu-nbd started (pid $(nbd_pid)) but is not listening on port $NBD_PORT"
@@ -537,6 +535,7 @@ cmd_main() {
     choice=$(ui_menu "What would you like to do?" \
         "fix|Fix it|back up, repair, verify, eject" \
         "backup|Back up only|image the data, change nothing" \
+        "verify|Verify boot|boot-readiness checks, no changes" \
         "details|Show details|full fsck output, no changes" \
         "quit|Quit|leave the card untouched")
 
@@ -544,9 +543,22 @@ cmd_main() {
     case "$choice" in
         fix)     cmd_fix "$disk" --yes ;;   # the menu was the confirmation
         backup)  cmd_backup "$disk" ;;
+        verify)  cmd_verify "$disk" ;;
         details) cmd_check "$disk" ;;
         quit|*)  info "nothing was changed"; return 0 ;;
     esac
+}
+
+cmd_verify() {
+    local deep="" args=() a
+    for a in "$@"; do case "$a" in --deep) deep=deep ;; *) args+=("$a") ;; esac; done
+    local disk; disk=$(resolve_disk "${args[0]:-}")
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    info "boot-readiness checks (read-only)${deep:+, with package checksums}"
+    set +e; rx "verify_boot $deep"; local rc=$?; set -e
+    trap - EXIT; detach
+    return "$rc"
 }
 
 cmd_fix() {
@@ -627,6 +639,8 @@ $(sed 's/^/  - /' <<<"$reasons")
     set +e
     local after; after=$(rx 'needs_repair' 2>/dev/null); local still=$?
     rx 'run_fsck check' 2>&1 | grep -E 'type=|exit=|superblock' || true
+    info "boot-readiness checks"
+    rx 'verify_boot'; local bootrc=$?
     set -e
     trap - EXIT
     if [ "$do_eject" = 1 ]; then detach --eject; else detach; fi
@@ -638,7 +652,12 @@ $(sed 's/^/  - /' <<<"$reasons")
         return 1
     fi
     [ "$rc" -ge 4 ] && { warn "e2fsck left errors uncorrected (exit $rc)"; return 1; }
-    ok "done - /dev/$disk is clean. Backup kept at: $b"
+    if [ "$bootrc" != 0 ]; then
+        warn "filesystems are clean, but the boot checks above found problems fsck cannot fix"
+        warn "backup is intact at: $b"
+        return 1
+    fi
+    ok "done - /dev/$disk is clean and looks bootable. Backup kept at: $b"
 }
 
 # Eject a card we are not currently holding open.
@@ -734,6 +753,10 @@ sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
   $0 list                      show removable disks
   $0 info    <disk>            partition table + filesystem state (read-only)
   $0 check   <disk>            fsck in read-only mode, reports what is wrong
+  $0 verify  <disk> [--deep]   boot-readiness: cmdline/fstab PARTUUIDs, kernel
+                               vs modules, dpkg state, NUL-filled configs,
+                               SSH host keys, lost+found. --deep also checks
+                               every package file against dpkg's md5sums.
   $0 backup  <disk>            image the USED space to $BACKUP_ROOT
   $0 repair  <disk> [--force]  fsck with repairs (needs a backup first)
   $0 mount   <disk>            mount partitions read-only for browsing
@@ -759,6 +782,7 @@ USAGE
 require_tools
 case "${1:-}" in
     fix)     shift; cmd_fix "$@" ;;
+    verify)  shift; cmd_verify "$@" ;;
     list)    shift; cmd_list "$@" ;;
     info)    shift; cmd_info "$@" ;;
     check)   shift; cmd_check "$@" ;;

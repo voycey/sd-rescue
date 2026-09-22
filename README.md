@@ -65,6 +65,7 @@ Individual steps, if you want them:
 | `sdrescue info` | partition table and filesystem state, read-only |
 | `sdrescue backup` | image the used space to `~/sdcard-rescue-backups/` |
 | `sdrescue check` | read-only fsck, reports what is wrong |
+| `sdrescue verify` | boot-readiness checks that fsck does not do (below). `--deep` also checksums every package file |
 | `sdrescue repair` | fsck with repairs. Refuses to run without a backup |
 | `sdrescue mount` | mount the partitions read-only for browsing |
 | `sdrescue shell` | a shell in the rescue container with the card attached |
@@ -72,6 +73,14 @@ Individual steps, if you want them:
 | `sdrescue detach --eject` | tear down the export and eject the card |
 
 All of these take an optional disk argument (`sdrescue info disk6`) when you want to name the card yourself. It is always the whole disk, never a partition.
+
+## Verify
+
+A clean fsck means the metadata is consistent, not that the card will boot. `sdrescue verify` mounts both partitions read-only and checks what the Pi's boot chain needs: `config.txt`, `cmdline.txt`, a kernel, device trees and initramfs on the boot partition; that `root=` in `cmdline.txt` and every entry in `/etc/fstab` point at this card's PARTUUIDs; that the kernel version in the boot image has a matching `/lib/modules` directory (the usual casualty of an upgrade cut off by a power failure); that systemd, the account files and the SSH host keys are present and not zero-length; that no file in `/etc` is NUL-filled; that dpkg was not interrupted and no package is half-installed; and what fsck left in `lost+found`. `fix` runs these after the repair.
+
+`sdrescue verify --deep` also checks every installed package file against dpkg's md5sums, which is the closest thing to proof that the file contents survived. It reads most of the used space, so give it the time.
+
+The firmware stage of a Pi boot cannot be tested off the Pi, and QEMU has no Pi 5 machine, so this stops short of an actual boot.
 
 ## Backups
 
