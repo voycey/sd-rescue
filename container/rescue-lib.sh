@@ -445,6 +445,62 @@ _verify_checks() {
         fi
     fi
 
+    # ---- boot partition files vs their dpkg-owned originals ----------------
+    # On Pi OS the kernel, initramfs, DTBs and overlays on the boot partition
+    # are copies of files under /boot and /usr/lib/linux-image-* on the root
+    # filesystem, which dpkg can verify. Comparing them verifies the boot
+    # partition's contents, not just its FAT structure.
+    if [ -n "$kver" ]; then
+        local src="$root/boot/vmlinuz-$kver" li="$root/usr/lib/linux-image-$kver" n=0 bad=0 f b
+        if [ -f "$src" ] && [ -n "$k" ]; then
+            cmp -s "$src" "$boot/$k" && v_ok "$k is byte-identical to /boot/vmlinuz-$kver" \
+                                     || v_fail "$k differs from /boot/vmlinuz-$kver (damaged copy of the kernel)"
+        fi
+        src="$root/boot/initrd.img-$kver"
+        if [ -f "$src" ]; then
+            for f in "$boot"/initramfs*; do
+                [ -f "$f" ] || continue
+                cmp -s "$src" "$f" && v_ok "$(basename "$f") is byte-identical to /boot/initrd.img-$kver" \
+                                   || v_fail "$(basename "$f") differs from /boot/initrd.img-$kver (damaged initramfs)"
+            done
+        fi
+        if [ -d "$li/broadcom" ]; then
+            for f in "$li"/broadcom/*.dtb "$li"/overlays/*; do
+                [ -f "$f" ] || continue
+                case "$f" in */broadcom/*) b="$boot/$(basename "$f")" ;; *) b="$boot/overlays/$(basename "$f")" ;; esac
+                [ -f "$b" ] || continue
+                n=$((n+1)); cmp -s "$f" "$b" || { bad=$((bad+1)); echo "        differs: ${b#$boot/}"; }
+            done
+            [ "$bad" -eq 0 ] && v_ok "$n device tree and overlay files match their originals" \
+                             || v_fail "$bad of $n device tree/overlay files differ from their originals"
+        fi
+    fi
+
+    # ---- did fsck.fat cut anything out of the boot partition? --------------
+    # The firmware files (start*.elf, fixup*.dat, bootcode.bin) come from the
+    # raspi-firmware package and are copied to the boot partition, so every
+    # file dpkg installed should be there, byte for byte. Anything fsck.fat
+    # could not reconcile it deletes; orphaned clusters end up as FSCK*.REC.
+    local rec fw="$root/usr/lib/raspi-firmware" fmiss=0 fdiff=0 fn=0
+    rec=$(ls "$boot"/FSCK*.REC "$boot"/fsck*.rec 2>/dev/null | wc -l)
+    [ "$rec" -gt 0 ] && v_fail "$rec FSCK*.REC file(s) on the boot partition: fsck.fat orphaned data here, something was cut loose"
+    if [ -d "$fw" ]; then
+        for f in "$fw"/*; do
+            [ -f "$f" ] || continue
+            fn=$((fn+1)); b="$boot/$(basename "$f")"
+            if [ ! -f "$b" ]; then fmiss=$((fmiss+1)); echo "        missing: $(basename "$f")"
+            elif ! cmp -s "$f" "$b"; then fdiff=$((fdiff+1)); echo "        differs: $(basename "$f")"; fi
+        done
+        if [ "$fmiss" -eq 0 ] && [ "$fdiff" -eq 0 ]; then v_ok "all $fn firmware files (start*.elf, fixup*.dat, bootcode.bin) present and identical to raspi-firmware"
+        else v_fail "firmware files on the boot partition: $fmiss missing, $fdiff differ (compared with /usr/lib/raspi-firmware)"; fi
+    fi
+    # the Pi 5 needs its own DTB by name; report it specifically
+    if ls "$boot"/bcm2712*.dtb >/dev/null 2>&1 || [ -f "$boot/kernel_2712.img" ]; then
+        [ -f "$boot/bcm2712-rpi-5-b.dtb" ] && v_ok "bcm2712-rpi-5-b.dtb present (Pi 5)" || v_fail "bcm2712-rpi-5-b.dtb missing: a Pi 5 will not boot this card"
+    fi
+    # and a full listing for the record, so a damaged card can be compared with a good one
+    echo "        boot partition holds $(find "$boot" -type f -not -path '*/.*' | wc -l) files, $(du -sh "$boot" | cut -f1)"
+
     # ---- init and essential files ----------------------------------------
     echo "  root filesystem"
     if [ -x "$root/usr/lib/systemd/systemd" ] || [ -x "$root/lib/systemd/systemd" ] || [ -e "$root/sbin/init" ]; then
