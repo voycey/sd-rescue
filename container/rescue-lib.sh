@@ -362,7 +362,7 @@ verify_boot() {
     umount "$root" "$boot" 2>/dev/null
     echo
     if [ "$V_FAILS" -gt 0 ]; then
-        echo "  result: $V_FAILS problem(s) that can stop the Pi booting, $V_WARNS warning(s)"
+        echo "  result: $V_FAILS problem(s) that need fixing on the Pi, $V_WARNS warning(s)"
         return 1
     fi
     echo "  result: no boot blockers found, $V_WARNS warning(s)"
@@ -521,13 +521,39 @@ _verify_checks() {
     cat "$info"/*.conffiles 2>/dev/null | sed 's|^/||' | sort -u > "$conf"
     cat "$info"/*.md5sums 2>/dev/null | awk 'NF==2' > "$list.all"
     awk 'NR==FNR{c[$1]=1;next} !($2 in c)' "$conf" "$list.all" > "$list"
-    res=$(cd "$root" && md5sum -c --quiet "$list" 2>&1 | grep -vE 'WARNING' )
-    local nbad; nbad=$(printf '%s' "$res" | grep -c .)
-    if [ "$nbad" -eq 0 ]; then
-        v_ok "$(wc -l < "$list") package files match their checksums"
-    else
-        v_fail "$nbad package file(s) changed or missing:"
-        printf '%s\n' "$res" | sed 's/^/        /' | head -25
+    # md5sum -c is silent until the end, so check in chunks and report as we go.
+    local total chunk=400 done=0 res="" part
+    total=$(wc -l < "$list")
+    split -l "$chunk" "$list" /tmp/verify.part.
+    for part in /tmp/verify.part.*; do
+        res="$res$(cd "$root" && md5sum -c --quiet "$part" 2>&1 | grep -v WARNING)
+"
+        done=$(( done + $(wc -l < "$part") ))
+        [ "$done" -gt "$total" ] && done=$total
+        printf '\r        checked %d / %d files' "$done" "$total" >&2
+    done
+    printf '\r%40s\r' '' >&2
+    rm -f /tmp/verify.part.*
+    res=$(printf '%s' "$res" | grep .)
+
+    # A changed file is not a boot blocker in itself. Missing or changed files
+    # under the directories the boot needs are; the rest are integrity warnings.
+    # EXTERNALLY-MANAGED is the PEP 668 marker people edit on purpose.
+    local missing changed_sys changed_other
+    missing=$(grep -E 'No such file' <<<"$res" | sed 's/^md5sum: //;s/: No such file.*//')
+    changed_sys=$(grep -E ': FAILED$' <<<"$res" | sed 's/: FAILED$//' | grep -E '^(usr/)?(bin|sbin|lib|lib64|lib32|libx32)/' | grep -v 'EXTERNALLY-MANAGED')
+    changed_other=$(grep -E ': FAILED$' <<<"$res" | sed 's/: FAILED$//' | grep -vE '^(usr/)?(bin|sbin|lib|lib64|lib32|libx32)/|EXTERNALLY-MANAGED')
+    local nmiss nsys noth
+    nmiss=$(grep -c . <<<"$missing"); nsys=$(grep -c . <<<"$changed_sys"); noth=$(grep -c . <<<"$changed_other")
+    grep -q 'EXTERNALLY-MANAGED' <<<"$res" && v_warn "usr/lib/python3.11/EXTERNALLY-MANAGED differs (the PEP 668 pip marker, usually edited on purpose)"
+    if [ "$nmiss" -eq 0 ] && [ "$nsys" -eq 0 ] && [ "$noth" -eq 0 ]; then
+        v_ok "$total package files match their checksums"
+        return
+    fi
+    [ "$nmiss" -gt 0 ] && { v_fail "$nmiss package file(s) missing:"; sed 's/^/        /' <<<"$missing" | head -20; }
+    [ "$nsys" -gt 0 ]  && { v_fail "$nsys binary/library file(s) differ from what dpkg installed:"; sed 's/^/        /' <<<"$changed_sys" | head -20; }
+    [ "$noth" -gt 0 ]  && { v_warn "$noth other package file(s) differ (data or docs; edited, or damaged):"; sed 's/^/        /' <<<"$changed_other" | head -20; }
+    if [ "$nmiss" -gt 0 ] || [ "$nsys" -gt 0 ]; then
         echo "        reinstall the owning packages on the Pi: dpkg -S <file> ; apt reinstall <pkg>"
     fi
 }
