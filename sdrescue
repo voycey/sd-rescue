@@ -808,6 +808,9 @@ sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
                                every partition, then fscks and boot-checks the result
   $0 detach                    tear down export + container
 
+  --no-unmount (or --no-eject) on any command leaves the card attached to
+  macOS afterwards, so several steps can run without reinserting it.
+
 Typical run for a Pi card that will not boot:
 
   $0 fix                 # finds the card itself
