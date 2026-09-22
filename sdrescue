@@ -407,7 +407,12 @@ latest_backup_for() {
     local diskid="$1" d
     [ -n "$diskid" ] || return 0
     for d in $(ls -1d "$BACKUP_ROOT"/*/ 2>/dev/null | sort -r); do
-        grep -q "^diskid: *$diskid\$" "$d/manifest.txt" 2>/dev/null && { echo "${d%/}"; return 0; }
+        # Older backups predate the diskid manifest line; their saved
+        # partition table records the same id as label-id.
+        if grep -q "^diskid: *$diskid\$" "$d/manifest.txt" 2>/dev/null \
+           || grep -qi "^label-id: *0x0*$diskid\$" "$d/partition-table.sfdisk" 2>/dev/null; then
+            echo "${d%/}"; return 0
+        fi
     done
     return 0
 }
