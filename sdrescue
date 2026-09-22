@@ -201,7 +201,18 @@ attach() {
     local disk="$1" mode="$2"        # mode: ro | rw
     mkdir -p "$STATE_DIR"
 
-    nbd_running && die "an export is already running ($(cat "$DISKFILE" 2>/dev/null)); run '$0 detach' first"
+    # A previous command (e.g. `mount`) may have left an export up. If it is
+    # for this same card, tear it down and re-attach in the mode we need
+    # (read-only vs read-write differ); refuse only if it is a different card.
+    if nbd_running; then
+        local running; running=$(cat "$DISKFILE" 2>/dev/null)
+        if [ "$running" = "$disk" ]; then
+            info "an export for /dev/$disk is already up; re-attaching for $mode access"
+            detach >/dev/null
+        else
+            die "an export is already running for $running; run '$0 detach' first"
+        fi
+    fi
 
     info "unmounting /dev/$disk from macOS"
     diskutil unmountDisk force "/dev/$disk" >/dev/null \
