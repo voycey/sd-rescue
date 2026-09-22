@@ -104,6 +104,7 @@ backup() {
     {
         echo "created:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "device:    $NBD_DEV"
+        echo "diskid:    $(sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed 's/^0x//')"
         echo "size:      $(blockdev --getsize64 "$NBD_DEV") bytes"
     } >> "$out/manifest.txt"
 
@@ -262,6 +263,7 @@ survey() {
     local bs bc fb fsstate ec fout clu cur tot bpc
 
     echo "disk.size=$(blockdev --getsize64 "$NBD_DEV" 2>/dev/null)"
+    echo "disk.id=$(sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed 's/^0x//')"
     echo "disk.table=$(sfdisk -l "$NBD_DEV" 2>/dev/null | sed -n 's/^Disklabel type: //p')"
 
     for p in "${NBD_DEV}"p*; do
@@ -456,14 +458,24 @@ _verify_checks() {
             cmp -s "$src" "$boot/$k" && v_ok "$k is byte-identical to /boot/vmlinuz-$kver" \
                                      || v_fail "$k differs from /boot/vmlinuz-$kver (damaged copy of the kernel)"
         fi
-        src="$root/boot/initrd.img-$kver"
-        if [ -f "$src" ]; then
-            for f in "$boot"/initramfs*; do
-                [ -f "$f" ] || continue
-                cmp -s "$src" "$f" && v_ok "$(basename "$f") is byte-identical to /boot/initrd.img-$kver" \
-                                   || v_fail "$(basename "$f") differs from /boot/initrd.img-$kver (damaged initramfs)"
-            done
-        fi
+        # Each initramfs on the boot partition belongs to a kernel flavour:
+        # initramfs_2712 -> *-2712, initramfs8 -> *-v8, initramfs7l -> *-v7l ...
+        local base flav
+        base="${kver%-*}"                      # 6.1.0-rpi8-rpi-2712 -> 6.1.0-rpi8-rpi
+        for f in "$boot"/initramfs*; do
+            [ -f "$f" ] || continue
+            case "$(basename "$f")" in
+                initramfs_2712) flav=2712 ;; initramfs8) flav=v8 ;; initramfs7l) flav=v7l ;;
+                initramfs7) flav=v7 ;; initramfs) flav=v6 ;; *) continue ;;
+            esac
+            src="$root/boot/initrd.img-$base-$flav"
+            [ -f "$src" ] || { v_warn "$(basename "$f") has no /boot/initrd.img-$base-$flav to compare with"; continue; }
+            if cmp -s "$src" "$f"; then
+                v_ok "$(basename "$f") is byte-identical to /boot/initrd.img-$base-$flav"
+            else
+                v_fail "$(basename "$f") differs from /boot/initrd.img-$base-$flav (damaged initramfs)"
+            fi
+        done
         if [ -d "$li/broadcom" ]; then
             for f in "$li"/broadcom/*.dtb "$li"/overlays/*; do
                 [ -f "$f" ] || continue

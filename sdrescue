@@ -373,9 +373,11 @@ cmd_check() {
 cmd_backup() {
     local disk; disk=$(resolve_disk "${1:-}")
     require_colima; trap cleanup_on_err EXIT
-    local stamp; stamp="$(date +%Y%m%d-%H%M%S)-$disk"
     attach "$disk" ro
-    info "imaging used space into $BACKUP_ROOT/$stamp"
+    local id stamp
+    id=$(rx 'sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed "s/^0x//"' 2>/dev/null)
+    stamp="$(date +%Y%m%d-%H%M%S)-${id:-$disk}"
+    info "imaging used space into $BACKUP_ROOT/$stamp (card id ${id:-unknown})"
     set +e; rx "backup /backup/$stamp"; local rc=$?; set -e
     trap - EXIT; detach
     if [ "$rc" -eq 0 ]; then
@@ -386,9 +388,29 @@ cmd_backup() {
     fi
 }
 
+# A backup belongs to a CARD, identified by its MBR disk id, never to a disk
+# number: every card in the built-in reader is "disk6". Directories are named
+# <timestamp>-<diskid> and the manifest records the id; older backups named
+# by disk number are only matched through their manifest.
 latest_backup_for() {
-    local disk="$1"
-    ls -1d "$BACKUP_ROOT"/*-"$disk" 2>/dev/null | sort | tail -1
+    local diskid="$1" d
+    [ -n "$diskid" ] || return 0
+    for d in $(ls -1d "$BACKUP_ROOT"/*/ 2>/dev/null | sort -r); do
+        grep -q "^diskid: *$diskid\$" "$d/manifest.txt" 2>/dev/null && { echo "${d%/}"; return 0; }
+    done
+    return 0
+}
+
+# Read the card's MBR disk id through a short read-only attach.
+card_id() {
+    local disk="$1" id
+    require_colima >/dev/null
+    trap cleanup_on_err EXIT
+    attach "$disk" ro >/dev/null
+    id=$(rx 'sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed "s/^0x//"' 2>/dev/null)
+    trap - EXIT
+    detach >/dev/null
+    printf '%s' "$id"
 }
 
 cmd_repair() {
@@ -396,7 +418,8 @@ cmd_repair() {
     for a in "$@"; do case "$a" in --force) force=1;; *) args+=("$a");; esac; done
     local disk; disk=$(resolve_disk "${args[0]:-}")
 
-    local b; b=$(latest_backup_for "$disk")
+    local id; id=$(card_id "$disk")
+    local b; b=$(latest_backup_for "$id")
     if [ -z "$b" ] || ! grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null; then
         if [ "$force" = 1 ]; then
             warn "no complete backup found, but --force was given"
@@ -488,7 +511,7 @@ render_plan() {
     local disk="$1" used=0 i n b
     n=$(sv part.count); n=${n:-0}
     for i in $(seq 1 "$n"); do used=$(( used + $(sv "part.$i.used" || echo 0) )); done
-    b=$(latest_backup_for "$disk")
+    b=$(latest_backup_for "$(sv disk.id)")
 
     ui_box_top "IF YOU CHOOSE FIX"
     ui_box_line "1. Image the used data      $(ui_bytes "$used") to copy"
@@ -585,12 +608,13 @@ ${c_bld}sdrescue fix /dev/$disk${c_off}
     fi
 
     # ---- 1. backup ----------------------------------------------------------
-    local b; b=$(latest_backup_for "$disk")
+    local id; id=$(card_id "$disk")
+    local b; b=$(latest_backup_for "$id")
     if [ "$fresh" = 1 ] || [ -z "$b" ] || ! grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null; then
         cmd_backup "$disk"
-        b=$(latest_backup_for "$disk")
+        b=$(latest_backup_for "$id")
     else
-        info "reusing the existing complete backup: $b"
+        info "reusing this card's existing complete backup: $b"
         info "(--fresh-backup re-images the card instead)"
     fi
     [ -n "$b" ] && grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null \
