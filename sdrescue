@@ -425,8 +425,8 @@ card_id() {
 }
 
 cmd_repair() {
-    local force=0 args=()
-    for a in "$@"; do case "$a" in --force) force=1;; *) args+=("$a");; esac; done
+    local force=0 yes=0 args=()
+    for a in "$@"; do case "$a" in --force) force=1;; --yes|-y) yes=1;; *) args+=("$a");; esac; done
     local disk; disk=$(resolve_disk "${args[0]:-}")
 
     local id; id=$(card_id "$disk")
@@ -441,10 +441,14 @@ cmd_repair() {
         info "using backup as safety net: $b"
     fi
 
-    confirm "
+    if [ "$yes" = 1 ]; then
+        warn "--yes given: repairing /dev/$disk read-write without the interactive confirmation"
+    else
+        confirm "
 ${c_yel}This attaches /dev/$disk READ-WRITE and lets e2fsck/fsck.fat modify it.
 Filesystem repair can discard unrecoverable data (lost+found, truncated files).${c_off}" \
-        "repair $disk"
+            "repair $disk"
+    fi
 
     require_colima; trap cleanup_on_err EXIT
     attach "$disk" rw
