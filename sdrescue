@@ -1,0 +1,776 @@
+#!/usr/bin/env bash
+#
+# sdrescue - inspect, image and repair Raspberry Pi SD cards from macOS,
+#            using the Linux filesystem tools inside the colima VM.
+#
+# How it works:
+#   macOS      qemu-nbd exports the raw card (/dev/rdiskN) over NBD on
+#              127.0.0.1:10809, read-only unless a repair was explicitly asked
+#              for.  The card is unmounted from macOS first so nothing here
+#              touches it.
+#   colima VM  a privileged container attaches that export as /dev/nbd0, so
+#              e2fsck/fsck.fat/partclone see the real card, partitions and all.
+#
+# Nothing is ever written to the card unless you run `repair` or `restore`,
+# and `repair` refuses to run without a completed backup.
+
+set -euo pipefail
+
+VERSION=1.0.0
+# Resolve through symlinks, so a link on PATH still finds tui.sh and askpass.
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+    _dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in /*) ;; *) _self="$_dir/$_self" ;; esac
+done
+HERE="$(cd -P "$(dirname "$_self")" && pwd)"
+unset _self _dir
+
+NBD_PORT="${SDRESCUE_PORT:-10809}"
+IMAGE="${SDRESCUE_IMAGE:-sdcard-rescue:latest}"
+CONTAINER="${SDRESCUE_CONTAINER:-sdrescue}"
+NBD_DEV="${SDRESCUE_NBD_DEV:-/dev/nbd0}"
+BACKUP_ROOT="${SDRESCUE_BACKUP_DIR:-$HOME/sdcard-rescue-backups}"
+STATE_DIR="${SDRESCUE_STATE_DIR:-$HOME/.sdrescue}"
+PIDFILE="$STATE_DIR/qemu-nbd.pid"
+MODEFILE="$STATE_DIR/mode"
+DISKFILE="$STATE_DIR/disk"
+
+# The colima VM reaches the macOS host on this address (gvisor user network).
+VM_HOST_IP="${SDRESCUE_HOST_IP:-192.168.5.2}"
+
+# ------------------------------------------------------------------ output --
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'
+c_blu=$'\033[34m'; c_bld=$'\033[1m';  c_off=$'\033[0m'
+c_dim=$'\033[2m'
+
+# shellcheck source=tui.sh
+. "$HERE/tui.sh"
+# Status lines start with a coloured dot rather than punctuation, so output
+# can be pasted back into a shell without ! triggering history expansion or
+# ==> / >>> being read as a command or a redirect.
+_status() { printf '  %s%s%s %s%-4s%s %s\n' "$1" "$G_DOT" "$c_off" "$1" "$2" "$c_off" "$3"; }
+info()  { _status "$c_blu" ""     "$*"; }
+ok()    { _status "$c_grn" "ok"   "$*"; }
+warn()  { _status "$c_yel" "warn" "$*" >&2; }
+die()   { _status "$c_red" "err"  "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------ prerequisites --
+require_tools() {
+    command -v colima    >/dev/null || die "colima not found"
+    command -v docker    >/dev/null || die "docker not found"
+    command -v qemu-nbd  >/dev/null || die "qemu-nbd not found (brew install qemu)"
+    command -v diskutil  >/dev/null || die "this tool is macOS only"
+}
+
+# sudo needs a terminal to prompt on. When there isn't one (running under an
+# editor, an agent or a pipe) fall back to a GUI password dialog via askpass.
+SUDO=(sudo)
+setup_sudo() {
+    sudo -n true 2>/dev/null && return 0          # already authenticated
+
+    # Authenticate up front so the later sudo calls never need to prompt.
+    #
+    # Talk to /dev/tty rather than testing stdin/stdout: this runs inside
+    # `attach ... >/dev/null`, so stdout is not a terminal even when the user
+    # is sitting at one, and -t 1 would send us down the askpass path wrongly.
+    if (exec 3</dev/tty) 2>/dev/null; then
+        info "administrator access is needed to read the card directly" >/dev/tty
+        sudo -v -p "$(printf '  %s%s%s      password: ' "$c_yel" "$G_DOT" "$c_off")" \
+            </dev/tty >/dev/tty 2>&1 || die "could not authenticate with sudo"
+        return 0
+    fi
+
+    [ -x "$HERE/askpass" ] || die "no terminal for sudo and $HERE/askpass is missing"
+    export SUDO_ASKPASS="$HERE/askpass"
+    SUDO=(sudo -A)
+    sudo -A -v || die "could not authenticate with sudo"
+}
+
+require_colima() {
+    colima status >/dev/null 2>&1 || {
+        info "colima is not running - starting it"
+        colima start
+    }
+    # nbd with partition scanning, needed so /dev/nbd0p1 etc. appear
+    colima ssh -- sudo modprobe nbd nbds_max=8 max_part=31 2>/dev/null || true
+    colima ssh -- test -b "$NBD_DEV" \
+        || die "the colima VM kernel has no $NBD_DEV (nbd module unavailable)"
+}
+
+build_image() {
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        info "building rescue image $IMAGE (first run only)"
+        docker build -t "$IMAGE" "$HERE/container"
+    fi
+}
+
+# ------------------------------------------------------------------- disks --
+# Is this whole disk an SD card we should be willing to touch?
+# "Protocol: Secure Digital" is the built-in reader. USB card readers report
+# Protocol: USB, so fall back to a removable disk whose media name looks like a
+# card reader. Anything non-removable or virtual is never a candidate.
+sd_candidate() {
+    local id="$1" inf
+    inf=$(diskutil info "$id" 2>/dev/null) || return 1
+    grep -q "Whole: *Yes"   <<<"$inf" || return 1
+    grep -q "Virtual: *Yes" <<<"$inf" && return 1
+    grep -q "Protocol: *Secure Digital" <<<"$inf" && return 0
+    grep -qE "Removable Media: *(Removable|Yes)" <<<"$inf" || return 1
+    grep -qiE "Device / Media Name:.*(SD|MMC|card.?reader)" <<<"$inf"
+}
+
+# Does the layout look like a Raspberry Pi card? (FAT32 boot + Linux root)
+looks_like_pi() {
+    local out; out=$(diskutil list "$1" 2>/dev/null) || return 1
+    grep -q "Windows_FAT_32" <<<"$out" && grep -qE " Linux " <<<"$out"
+}
+
+all_disks() { diskutil list | awk '/^\/dev\/disk[0-9]+ \(/{gsub(/[:]/,"");sub(/^\/dev\//,"",$1);print $1}'; }
+
+# Pick the SD card automatically. Refuses to guess when there is more than one.
+find_sd_card() {
+    local d cands=() pi=()
+    for d in $(all_disks); do
+        sd_candidate "$d" || continue
+        cands+=("$d")
+        looks_like_pi "$d" && pi+=("$d")
+    done
+
+    # A Pi-shaped card beats a generic one; that is the tiebreaker.
+    [ "${#pi[@]}" -eq 1 ] && { echo "${pi[0]}"; return 0; }
+    [ "${#cands[@]}" -eq 1 ] && { echo "${cands[0]}"; return 0; }
+
+    if [ "${#cands[@]}" -eq 0 ]; then
+        die "no SD card found - insert one, or name the disk explicitly (see: $0 list)"
+    fi
+    warn "more than one SD card is inserted:"
+    for d in "${cands[@]}"; do
+        warn "  $d  $(diskutil info "$d" | awk -F': *' '/Device \/ Media Name/{print $2; exit}')"
+    done
+    die "name the one you mean, e.g. '$0 fix ${cands[0]}'"
+}
+
+resolve_disk() {
+    local d="${1:-}"
+    if [ -z "$d" ]; then
+        d=$(find_sd_card) || exit 1
+        info "auto-detected SD card: /dev/$d  ($(diskutil info "$d" | awk -F': *' '/Device \/ Media Name/{print $2; exit}'))" >&2
+    fi
+    d="${d#/dev/}"; d="${d#r}"
+    [[ "$d" =~ ^disk[0-9]+$ ]] || die "'$1' is not a whole disk (want e.g. disk6)"
+    [ -b "/dev/$d" ] || die "/dev/$d does not exist"
+    # Refuse anything that is not a removable, external-ish physical disk.
+    local inf; inf=$(diskutil info "$d")
+    grep -q "Whole: *Yes"                 <<<"$inf" || die "/dev/$d is not a whole disk"
+    grep -qE "Removable Media: *(Removable|Yes)" <<<"$inf" \
+        || die "/dev/$d is not removable - refusing to touch it"
+    grep -q "Virtual: *Yes" <<<"$inf" && die "/dev/$d is a virtual disk"
+    echo "$d"
+}
+
+cmd_list() {
+    info "SD cards"
+    local auto found=0 d mark
+    auto=$(find_sd_card 2>/dev/null) || auto=""
+    for d in $(all_disks); do
+        sd_candidate "$d" || continue
+        found=1
+        mark=""; [ "$d" = "$auto" ] && mark="  ${c_grn}<- picked automatically${c_off}"
+        printf '\n%s%s%s  %s  %s%s\n' "$c_bld" "$d" "$c_off" \
+            "$(diskutil info "$d" | awk -F': *' '/Disk Size/{print $2; exit}')" \
+            "$(diskutil info "$d" | awk -F': *' '/Device \/ Media Name/{print $2; exit}')" "$mark"
+        diskutil list "$d" | tail -n +3 | sed 's/^/    /'
+    done
+    [ "$found" = 1 ] || warn "no SD card found"
+}
+
+# ------------------------------------------------------------------ attach --
+# qemu-nbd runs as root, so `kill -0` from our uid is EPERM; ask ps instead.
+nbd_pid()     { cat "$PIDFILE" 2>/dev/null; }
+nbd_running() { local p; p=$(nbd_pid); [ -n "$p" ] && ps -p "$p" >/dev/null 2>&1; }
+
+attach() {
+    local disk="$1" mode="$2"        # mode: ro | rw
+    mkdir -p "$STATE_DIR"
+
+    nbd_running && die "an export is already running ($(cat "$DISKFILE" 2>/dev/null)); run '$0 detach' first"
+
+    info "unmounting /dev/$disk from macOS"
+    diskutil unmountDisk force "/dev/$disk" >/dev/null \
+        || die "could not unmount /dev/$disk"
+
+    # Build one argument list that is never empty: macOS ships bash 3.2, where
+    # expanding an empty array under `set -u` is an "unbound variable" error.
+    local label="read-only"
+    # Loopback only: the colima VM reaches the host's 127.0.0.1 through the
+    # user-mode network gateway, so nothing on the LAN can see the card.
+    local qargs=(--format=raw --persistent --shared=8 --cache=writethrough
+                 --bind=127.0.0.1 --port="$NBD_PORT")
+    if [ "$mode" = rw ]; then
+        label="${c_red}READ-WRITE${c_off}"
+    else
+        qargs+=(--read-only)
+    fi
+    qargs+=("/dev/r$disk")
+
+    # A `fix` run attaches, detaches and re-attaches several times. The port
+    # from the previous export can still be bound when the next one starts, and
+    # qemu-nbd then sits there never listening - so wait for it to clear first.
+    local w
+    for w in $(seq 1 40); do
+        nc -z 127.0.0.1 "$NBD_PORT" 2>/dev/null || break
+        [ "$w" = 1 ] && info "waiting for port $NBD_PORT to be released"
+        sleep 0.5
+    done
+    if nc -z 127.0.0.1 "$NBD_PORT" 2>/dev/null; then
+        die "port $NBD_PORT is still in use - run '$0 detach' and try again"
+    fi
+
+    info "exporting /dev/r$disk over NBD ($label) - sudo needed for raw access"
+    setup_sudo
+    rm -f "$PIDFILE"
+    # Run sudo in the FOREGROUND and let qemu-nbd daemonise itself. sudo 1.9.14+
+    # defaults to use_pty, which takes over the terminal's foreground process
+    # group: as a background job that earns an immediate SIGTTOU and a stopped,
+    # silent sudo. With --fork, qemu-nbd binds the socket first and only then
+    # detaches, so when this returns 0 the export is already listening.
+    if ! "${SUDO[@]}" qemu-nbd "${qargs[@]}" --fork --pid-file="$PIDFILE" \
+            2>"$STATE_DIR/qemu-nbd.log"; then
+        warn "qemu-nbd failed to start:"
+        sed 's/^/      /' "$STATE_DIR/qemu-nbd.log" >&2
+        die "could not export the card"
+    fi
+    echo "$mode" > "$MODEFILE"
+    echo "$disk" > "$DISKFILE"
+    # The daemon writes its pid file a moment after the parent returns; if it
+    # has not appeared yet, find the process by its command line instead.
+    local w
+    for w in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$PIDFILE" ] && break
+        sleep 0.2
+    done
+    [ -s "$PIDFILE" ] || pgrep -f "^qemu-nbd .*--port=$NBD_PORT" | head -1 > "$PIDFILE" 2>/dev/null || true
+
+    if ! nc -z 127.0.0.1 "$NBD_PORT" 2>/dev/null; then
+        warn "qemu-nbd started (pid $(nbd_pid)) but is not listening on port $NBD_PORT"
+        [ -s "$STATE_DIR/qemu-nbd.log" ] && sed 's/^/      /' "$STATE_DIR/qemu-nbd.log" >&2
+        die "could not export the card"
+    fi
+    ok "NBD export live on port $NBD_PORT (qemu-nbd pid $(nbd_pid))"
+
+    build_image
+    info "starting rescue container"
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    mkdir -p "$BACKUP_ROOT"
+    docker run -d --name "$CONTAINER" \
+        --privileged \
+        --network host \
+        --pid host \
+        -v /dev:/dev \
+        -v "$BACKUP_ROOT:/backup" \
+        -e NBD_DEV="$NBD_DEV" \
+        "$IMAGE" sleep infinity >/dev/null
+
+    info "attaching card as $NBD_DEV inside the VM"
+    local nargs=(-N '')
+    [ "$mode" = ro ] && nargs=(-readonly -N '')
+    docker exec "$CONTAINER" nbd-client "${nargs[@]}" \
+        "$VM_HOST_IP" "$NBD_PORT" "$NBD_DEV" \
+        || die "nbd-client could not attach the card"
+
+    # Give the kernel a moment to scan the partition table.
+    sleep 1
+    docker exec "$CONTAINER" partprobe "$NBD_DEV" >/dev/null 2>&1 || true
+    sleep 1
+    ok "card attached at $NBD_DEV ($label)"
+}
+
+detach() {
+    local do_eject=0
+    [ "${1:-}" = "--eject" ] && do_eject=1
+    local disk; disk=$(cat "$DISKFILE" 2>/dev/null || true)
+
+    if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+        info "flushing and detaching $NBD_DEV"
+        docker exec "$CONTAINER" sync 2>/dev/null || true
+        docker exec "$CONTAINER" nbd-client -d "$NBD_DEV" 2>/dev/null || true
+        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    fi
+
+    if pgrep -f "qemu-nbd.*--port=$NBD_PORT" >/dev/null 2>&1; then
+        info "stopping NBD export"
+        setup_sudo
+        # Prefer the pid qemu-nbd wrote for itself; fall back to matching by
+        # command line in case the pid file is stale or missing.
+        if nbd_running; then
+            "${SUDO[@]}" kill "$(nbd_pid)" 2>/dev/null || true
+        else
+            "${SUDO[@]}" pkill -f "qemu-nbd.*--port=$NBD_PORT" 2>/dev/null || true
+        fi
+        # Wait for it to actually exit: qemu-nbd flushes on the way out, and
+        # ejecting before it has let go would be ejecting a card still in use.
+        local i
+        for i in $(seq 1 60); do
+            pgrep -f "qemu-nbd.*--port=$NBD_PORT" >/dev/null 2>&1 || break
+            sleep 0.5
+        done
+        if pgrep -f "qemu-nbd.*--port=$NBD_PORT" >/dev/null 2>&1; then
+            warn "qemu-nbd has not exited - leaving the card alone, check it by hand"
+            rm -f "$PIDFILE" "$MODEFILE" "$DISKFILE"
+            return 1
+        fi
+    fi
+    rm -f "$PIDFILE" "$MODEFILE" "$DISKFILE"
+
+    if [ "$do_eject" = 1 ] && [ -n "$disk" ]; then
+        info "ejecting /dev/$disk"
+        if diskutil eject "/dev/$disk" >/dev/null 2>&1; then
+            ok "ejected - the card is safe to remove"
+        else
+            warn "macOS refused to eject /dev/$disk (it may have re-mounted bootfs)"
+            warn "eject it from Finder before pulling the card"
+            return 1
+        fi
+    else
+        ok "detached (card is still attached to macOS; '$0 detach --eject' to eject)"
+    fi
+}
+
+cleanup_on_err() { detach >/dev/null 2>&1 || true; }
+
+rx() { docker exec "$CONTAINER" bash -c "source /usr/local/lib/rescue-lib.sh; $*"; }
+rxi() { docker exec -it "$CONTAINER" bash -c "source /usr/local/lib/rescue-lib.sh; $*"; }
+
+confirm() {
+    local prompt="$1" want="$2" answer
+    [ -t 0 ] || die "this step needs a typed confirmation, so it must be run in a real terminal window (Terminal.app / iTerm), not through a pipe"
+    printf '%s\n' "$prompt"
+    printf 'Type %s%s%s to continue: ' "$c_bld" "$want" "$c_off"
+    read -r answer
+    [ "$answer" = "$want" ] || die "aborted"
+}
+
+# --------------------------------------------------------------- commands ---
+cmd_info() {
+    local disk; disk=$(resolve_disk "${1:-}")
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    rx report
+    trap - EXIT; detach
+}
+
+cmd_check() {
+    local disk; disk=$(resolve_disk "${1:-}")
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    info "read-only filesystem check (no repairs are written)"
+    set +e; rx 'run_fsck check'; local rc=$?; set -e
+    trap - EXIT; detach
+    [ "$rc" -ge 4 ] && warn "errors found that need repair - run: $0 backup $disk && $0 repair $disk"
+    return 0
+}
+
+cmd_backup() {
+    local disk; disk=$(resolve_disk "${1:-}")
+    require_colima; trap cleanup_on_err EXIT
+    local stamp; stamp="$(date +%Y%m%d-%H%M%S)-$disk"
+    attach "$disk" ro
+    info "imaging used space into $BACKUP_ROOT/$stamp"
+    set +e; rx "backup /backup/$stamp"; local rc=$?; set -e
+    trap - EXIT; detach
+    if [ "$rc" -eq 0 ]; then
+        ok "backup complete: $BACKUP_ROOT/$stamp"
+        du -sh "$BACKUP_ROOT/$stamp"
+    else
+        die "backup INCOMPLETE - do not repair this card yet: $BACKUP_ROOT/$stamp"
+    fi
+}
+
+latest_backup_for() {
+    local disk="$1"
+    ls -1d "$BACKUP_ROOT"/*-"$disk" 2>/dev/null | sort | tail -1
+}
+
+cmd_repair() {
+    local force=0 args=()
+    for a in "$@"; do case "$a" in --force) force=1;; *) args+=("$a");; esac; done
+    local disk; disk=$(resolve_disk "${args[0]:-}")
+
+    local b; b=$(latest_backup_for "$disk")
+    if [ -z "$b" ] || ! grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null; then
+        if [ "$force" = 1 ]; then
+            warn "no complete backup found, but --force was given"
+        else
+            die "no complete backup for $disk - run '$0 backup $disk' first (or --force)"
+        fi
+    else
+        info "using backup as safety net: $b"
+    fi
+
+    confirm "
+${c_yel}This attaches /dev/$disk READ-WRITE and lets e2fsck/fsck.fat modify it.
+Filesystem repair can discard unrecoverable data (lost+found, truncated files).${c_off}" \
+        "repair $disk"
+
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" rw
+    set +e; rx 'run_fsck repair'; local rc=$?; set -e
+    trap - EXIT; detach
+    if [ "$rc" -ge 4 ]; then
+        warn "fsck left errors uncorrected (exit $rc) - run '$0 check $disk' and inspect"
+    else
+        ok "repair finished - re-run '$0 check $disk' to confirm the card is clean"
+    fi
+}
+
+# --------------------------------------------------------------- main view ---
+# Survey the card read-only, show what is wrong, then offer to fix it.
+survey_card() {
+    local disk="$1"
+    trap cleanup_on_err EXIT
+    attach "$disk" ro >/dev/null
+    SURVEY=$(rx 'survey' 2>/dev/null)
+    trap - EXIT
+    detach >/dev/null
+}
+
+sv() { sed -n "s/^$1=//p" <<<"$SURVEY" | head -1; }
+
+render_card() {
+    local disk="$1" media n i fs label dev size used state detail
+    media=$(diskutil info "$disk" | awk -F': *' '/Device \/ Media Name/{print $2; exit}')
+
+    printf '\n'
+    ui_box_top "SD CARD"
+    ui_box_line "$(printf '%-28s %s  %s' "$media" "/dev/$disk" "$(ui_bytes "$(sv disk.size)")")"
+    ui_box_bot
+    printf '\n'
+
+    printf '  %s%-11s %-7s %-9s %-8s %s%s\n' "$c_dim" PARTITION FS SIZE USED STATE "$c_off"
+    ui_rule
+    n=$(sv part.count); n=${n:-0}
+    for i in $(seq 1 "$n"); do
+        dev=$(sv "part.$i.dev");   fs=$(sv "part.$i.fs")
+        label=$(sv "part.$i.label"); size=$(sv "part.$i.size")
+        used=$(sv "part.$i.used");  state=$(sv "part.$i.state")
+        printf '  %-11s %-7s %-9s %-8s %s\n' \
+            "${label:-$dev}" "${fs:-?}" "$(ui_bytes "$size")" "$(ui_bytes "$used")" "$(ui_state_glyph "$state")"
+    done
+    printf '\n'
+
+    # findings
+    local bad=0
+    for i in $(seq 1 "$n"); do
+        state=$(sv "part.$i.state")
+        [ "$state" = clean ] && continue
+        bad=1
+    done
+    if [ "$bad" = 0 ]; then
+        ui_box_top "FINDINGS"
+        ui_box_line "$c_grn$G_OK$c_off Nothing wrong. Both filesystems are clean."
+        ui_box_bot
+        printf '\n'
+        return 1
+    fi
+
+    ui_box_top "FINDINGS"
+    for i in $(seq 1 "$n"); do
+        state=$(sv "part.$i.state"); [ "$state" = clean ] && continue
+        label=$(sv "part.$i.label"); dev=$(sv "part.$i.dev"); detail=$(sv "part.$i.detail")
+        ui_box_line "$c_red$G_BAD$c_off ${label:-$dev}: $detail"
+    done
+    ui_box_bot
+    printf '\n'
+    return 0
+}
+
+render_plan() {
+    local disk="$1" used=0 i n b
+    n=$(sv part.count); n=${n:-0}
+    for i in $(seq 1 "$n"); do used=$(( used + $(sv "part.$i.used" || echo 0) )); done
+    b=$(latest_backup_for "$disk")
+
+    ui_box_top "IF YOU CHOOSE FIX"
+    ui_box_line "1. Image the used data      $(ui_bytes "$used") to copy"
+    if [ -n "$b" ] && grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null; then
+        ui_box_line "   ${c_grn}already done${c_off}, will be reused:"
+        ui_box_line "   ${c_dim}${b/#$HOME/~}${c_off}"
+    else
+        ui_box_line "   ${c_dim}${BACKUP_ROOT/#$HOME/~}/${c_off}"
+    fi
+    ui_box_line "2. Replay the journal and run fsck to repair"
+    ui_box_line "3. Re-check, then eject the card"
+    ui_box_bot
+    printf '\n'
+    ui_box_top "BEFORE YOU DO"
+    ui_box_line "Step 2 writes to the card. Repair can discard data"
+    ui_box_line "it cannot recover (into lost+found, or truncated)."
+    ui_box_line "Step 1 is the safety net, and runs first."
+    ui_box_bot
+    printf '\n'
+}
+
+cmd_main() {
+    local args=() a
+    for a in "$@"; do case "$a" in -*) ;; *) args+=("$a");; esac; done
+    local disk; disk=$(resolve_disk "${args[0]:-}")
+
+    require_tools
+    require_colima
+    setup_sudo        # prompt now, as its own line, not mid-progress
+    printf '\n  %sinspecting /dev/%s (read-only)...%s' "$c_dim" "$disk" "$c_off"
+    survey_card "$disk"
+    printf '\r\033[2K'
+
+    if ! render_card "$disk"; then
+        # clean card: nothing to offer
+        printf '  %sNothing to do.%s\n\n' "$c_dim" "$c_off"
+        return 0
+    fi
+    render_plan "$disk"
+
+    [ -t 0 ] || { warn "not a terminal - re-run in a terminal, or use: $0 fix $disk --yes"; return 1; }
+
+    local choice
+    choice=$(ui_menu "What would you like to do?" \
+        "fix|Fix it|back up, repair, verify, eject" \
+        "backup|Back up only|image the data, change nothing" \
+        "details|Show details|full fsck output, no changes" \
+        "quit|Quit|leave the card untouched")
+
+    printf '\n'
+    case "$choice" in
+        fix)     cmd_fix "$disk" --yes ;;   # the menu was the confirmation
+        backup)  cmd_backup "$disk" ;;
+        details) cmd_check "$disk" ;;
+        quit|*)  info "nothing was changed"; return 0 ;;
+    esac
+}
+
+cmd_fix() {
+    local yes=0 fresh=0 do_eject=1 args=() a
+    for a in "$@"; do case "$a" in
+        --yes|-y)        yes=1 ;;
+        --fresh-backup)  fresh=1 ;;
+        --no-eject)      do_eject=0 ;;
+        *)               args+=("$a") ;;
+    esac; done
+    local disk; disk=$(resolve_disk "${args[0]:-}")
+
+    printf '%s\n' "
+${c_bld}sdrescue fix /dev/$disk${c_off}
+  1. image the used space to $BACKUP_ROOT
+  2. check both filesystems read-only
+  3. ${c_yel}repair them, but only if step 2 finds something wrong${c_off}
+  4. re-check, then eject the card
+"
+    if [ "$yes" = 1 ]; then
+        warn "--yes given: running without the interactive confirmation"
+    else
+        confirm "Step 3 writes to the card. The backup from step 1 is the safety net." "fix $disk"
+    fi
+
+    # ---- 1. backup ----------------------------------------------------------
+    local b; b=$(latest_backup_for "$disk")
+    if [ "$fresh" = 1 ] || [ -z "$b" ] || ! grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null; then
+        cmd_backup "$disk"
+        b=$(latest_backup_for "$disk")
+    else
+        info "reusing the existing complete backup: $b"
+        info "(--fresh-backup re-images the card instead)"
+    fi
+    [ -n "$b" ] && grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null \
+        || die "no usable backup - stopping before anything is written"
+
+    # ---- 2. triage ----------------------------------------------------------
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    info "checking what is wrong (read-only)"
+    local reasons want_repair
+    set +e
+    reasons=$(rx 'needs_repair' 2>/dev/null)
+    want_repair=$?
+    set -e
+    rx 'run_fsck check' 2>&1 | grep -vE '^ +[0-9]+ ' || true
+    trap - EXIT; detach
+
+    if [ "$want_repair" != 0 ]; then
+        ok "nothing to repair - both filesystems are clean"
+        [ "$do_eject" = 1 ] && { attach_none_eject "$disk"; }
+        return 0
+    fi
+
+    printf '%s\n' "
+${c_yel}Repair is needed:${c_off}
+$(sed 's/^/  - /' <<<"$reasons")
+"
+    # A filesystem with no readable superblock is past what e2fsck can do;
+    # carrying on would only risk making it worse.
+    if grep -q 'no readable superblock' <<<"$reasons"; then
+        warn "at least one partition has no readable superblock anywhere"
+        warn "e2fsck cannot help. The backup is safe at: $b"
+        warn "next step is testdisk/photorec against that image, not a repair here"
+        return 2
+    fi
+
+    # ---- 3. repair ----------------------------------------------------------
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" rw
+    set +e; rx 'run_fsck repair'; local rc=$?; set -e
+    trap - EXIT; detach
+
+    # ---- 4. verify ----------------------------------------------------------
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    set +e
+    local after; after=$(rx 'needs_repair' 2>/dev/null); local still=$?
+    rx 'run_fsck check' 2>&1 | grep -E 'type=|exit=|superblock' || true
+    set -e
+    trap - EXIT
+    if [ "$do_eject" = 1 ]; then detach --eject; else detach; fi
+
+    if [ "$still" = 0 ]; then
+        warn "the card still reports problems after the repair:"
+        sed 's/^/  - /' <<<"$after" >&2
+        warn "backup is intact at: $b"
+        return 1
+    fi
+    [ "$rc" -ge 4 ] && { warn "e2fsck left errors uncorrected (exit $rc)"; return 1; }
+    ok "done - /dev/$disk is clean. Backup kept at: $b"
+}
+
+# Eject a card we are not currently holding open.
+attach_none_eject() {
+    info "ejecting /dev/$1"
+    diskutil eject "/dev/$1" >/dev/null 2>&1 \
+        && ok "ejected - the card is safe to remove" \
+        || warn "macOS refused to eject /dev/$1 - eject it from Finder"
+}
+
+cmd_shell() {
+    local rw=0 args=()
+    for a in "$@"; do case "$a" in --rw) rw=1;; *) args+=("$a");; esac; done
+    local disk; disk=$(resolve_disk "${args[0]:-}")
+    require_colima; trap cleanup_on_err EXIT
+    if [ "$rw" = 1 ]; then
+        confirm "${c_yel}Opening a READ-WRITE shell on /dev/$disk.${c_off}" "rw $disk"
+        attach "$disk" rw
+    else
+        attach "$disk" ro
+    fi
+    info "card is at $NBD_DEV (partitions ${NBD_DEV}p1, ${NBD_DEV}p2 ...)"
+    info "helpers: report, run_fsck check|repair, backup /backup/NAME"
+    info "exit the shell to detach cleanly"
+    rxi 'exec bash' || true
+    trap - EXIT; detach
+}
+
+cmd_mount() {
+    local disk; disk=$(resolve_disk "${1:-}")
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    info "mounting partitions read-only under /mnt inside the container"
+    rx '
+        for p in ${NBD_DEV}p*; do
+            [ -b "$p" ] || continue
+            m=/mnt/$(basename "$p")
+            mkdir -p "$m"
+            if mount -o ro,noload "$p" "$m" 2>/dev/null || mount -o ro "$p" "$m" 2>/dev/null; then
+                echo "mounted $p -> $m"
+            else
+                echo "could not mount $p (filesystem may need repair)"
+            fi
+        done
+        df -h /mnt/* 2>/dev/null'
+    info "browse it with:  docker exec -it $CONTAINER bash"
+    info "when finished:   $0 detach"
+    trap - EXIT
+}
+
+cmd_restore() {
+    local src="${1:-}" disk; disk=$(resolve_disk "${2:-}")
+    [ -d "$src" ] || die "usage: $0 restore <backup-dir> <disk>"
+    [ -f "$src/manifest.txt" ] || die "$src has no manifest.txt"
+    cat "$src/manifest.txt"
+    confirm "
+${c_red}This OVERWRITES /dev/$disk with the backup above. Everything on the card is lost.${c_off}" \
+        "restore $disk"
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" rw
+    local name; name=$(basename "$src")
+    rx "
+        set -e
+        cd /backup/$name
+        for f in *.pcl; do
+            [ -e \"\$f\" ] || continue
+            p=\${f%.pcl}
+            echo '>>> restoring' \$f '->' \$NBD_DEV\${p#nbd0}
+            partclone.extfs -r -s \"\$f\" -o /dev/\$p
+        done
+        for f in *.img; do
+            [ -e \"\$f\" ] || continue
+            p=\${f%.img}
+            echo '>>> restoring' \$f '->' /dev/\$p
+            dd if=\"\$f\" of=/dev/\$p bs=4M status=progress conv=fsync
+        done
+        sync"
+    trap - EXIT; detach
+    ok "restore complete"
+}
+
+usage() {
+    cat <<USAGE
+sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
+
+  $0                           inspect the card, show what is wrong, and
+                               offer to fix it.  This is the normal way in.
+  $0 fix     [disk] [--yes]    the same job without the menu, for scripts,
+                               re-check, eject.  This is what you usually want.
+                               --yes skips the typed confirmation (for scripts),
+                               --fresh-backup re-images even if a backup exists,
+                               --no-eject leaves the card attached.
+  $0 list                      show removable disks
+  $0 info    <disk>            partition table + filesystem state (read-only)
+  $0 check   <disk>            fsck in read-only mode, reports what is wrong
+  $0 backup  <disk>            image the USED space to $BACKUP_ROOT
+  $0 repair  <disk> [--force]  fsck with repairs (needs a backup first)
+  $0 mount   <disk>            mount partitions read-only for browsing
+  $0 shell   <disk> [--rw]     shell in the rescue container
+  $0 restore <backup-dir> <disk>   write a backup back to a card
+  $0 detach                    tear down export + container
+
+Typical run for a Pi card that will not boot:
+
+  $0 fix                 # finds the card itself
+
+which is the steps below, with a repair only if the check finds something:
+
+  $0 backup disk6        # image used space - always first
+  $0 check  disk6
+  $0 repair disk6
+  $0 check  disk6
+
+<disk> is the WHOLE disk (disk6), never a partition (disk6s2).
+USAGE
+}
+
+require_tools
+case "${1:-}" in
+    fix)     shift; cmd_fix "$@" ;;
+    list)    shift; cmd_list "$@" ;;
+    info)    shift; cmd_info "$@" ;;
+    check)   shift; cmd_check "$@" ;;
+    backup)  shift; cmd_backup "$@" ;;
+    repair)  shift; cmd_repair "$@" ;;
+    mount)   shift; cmd_mount "$@" ;;
+    shell)   shift; cmd_shell "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    detach)  shift; detach "$@" ;;
+    ""|--no-eject|--fresh-backup) cmd_main "$@" ;;
+    -h|--help|help) usage ;;
+    # bare "sdrescue disk6" does the sensible whole-job thing
+    disk[0-9]*|/dev/disk[0-9]*|/dev/rdisk[0-9]*) cmd_main "$@" ;;
+    *) die "unknown command '$1' (try --help)" ;;
+esac

@@ -1,0 +1,6 @@
+#!/bin/sh
+# SUDO_ASKPASS helper: asks for the password in a macOS dialog when there is no
+# terminal to prompt on (running under an editor, an agent, or a pipe).
+# The password goes straight to sudo on stdout and is never stored.
+osascript -e 'display dialog "sdrescue needs administrator access to read the SD card directly.\n\nEnter your macOS password:" default answer "" with hidden answer with title "sdrescue" with icon caution' \
+          -e 'text returned of result' 2>/dev/null
