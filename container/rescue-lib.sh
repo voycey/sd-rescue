@@ -359,6 +359,10 @@ verify_boot() {
     mkdir -p "$boot" "$root"
     local merr
     merr=$(mount -o ro "$bp" "$boot" 2>&1) || { v_fail "cannot mount $bp (boot): $merr"; return 1; }
+    if dumpe2fs -h "$rp" 2>/dev/null | grep -q needs_recovery; then
+        v_fail "the root filesystem has an unreplayed journal (needs_recovery): run '$(printf repair)' first; a read-only check cannot see past it"
+        umount "$boot"; return 1
+    fi
     if ! merr=$(mount -o ro "$rp" "$root" 2>&1); then
         v_fail "cannot mount $rp (root): $merr"
         dmesg 2>/dev/null | grep -iE 'ext4|nbd0p2' | tail -3 | sed 's/^/        kernel: /'
@@ -713,6 +717,14 @@ restore_backup() {
         partclone.extfs -r -s "$f" -o "$p" -F -L "$dir/restore.partclone.log" >/dev/null 2>&1 \
             || { echo "  err   partclone restore failed on $p:"; tail -5 "$dir/restore.partclone.log"; return 1; }
         grep -E 'Total Time|successfully' "$dir/restore.partclone.log" | tail -2 | sed 's/^/        /'
+        # A backup of a card cut off mid-write carries its unreplayed journal;
+        # the restore reproduces it faithfully. Replay it now, as the Pi would
+        # on boot, so the restored card mounts cleanly and verifies.
+        if dumpe2fs -h "$p" 2>/dev/null | grep -q needs_recovery; then
+            echo "  replaying the journal captured in the backup"
+            e2fsck -f -y "$p" >/dev/null 2>&1
+            [ $? -lt 4 ] || { echo "  err   e2fsck could not replay the journal on $p"; return 1; }
+        fi
     done
     sync
     # The raw boot image carries whatever state it was captured in (macOS
