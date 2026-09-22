@@ -387,10 +387,11 @@ cmd_backup() {
     local disk; disk=$(resolve_disk "${1:-}")
     require_colima; trap cleanup_on_err EXIT
     attach "$disk" ro
-    local id stamp
+    local id host stamp
     id=$(rx 'sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed "s/^0x//"' 2>/dev/null)
-    stamp="$(date +%Y%m%d-%H%M%S)-${id:-$disk}"
-    info "imaging used space into $BACKUP_ROOT/$stamp (card id ${id:-unknown})"
+    host=$(rx 'card_hostname' 2>/dev/null)
+    stamp="$(date +%Y%m%d-%H%M%S)-${host:-unknown}-${id:-$disk}"
+    info "imaging used space into $BACKUP_ROOT/$stamp (${host:-unknown host}, card id ${id:-unknown})"
     set +e; rx "backup /backup/$stamp"; local rc=$?; set -e
     trap - EXIT; detach
     if [ "$rc" -eq 0 ]; then
@@ -488,6 +489,7 @@ render_card() {
     printf '\n'
     ui_box_top "SD CARD"
     ui_box_line "$(printf '%-28s %s  %s' "$media" "/dev/$disk" "$(ui_bytes "$(sv disk.size)")")"
+    ui_box_line "$(printf '%-28s %s' "${c_bld}$(sv disk.host)${c_off}" "card id $(sv disk.id)")"
     ui_box_bot
     printf '\n'
 
@@ -879,11 +881,55 @@ cmd_mount() {
     trap - EXIT
 }
 
+# Read a field from a backup's manifest; for the disk id fall back to the
+# saved partition table (older backups did not record it in the manifest).
+bk_field() {
+    local d="$1" f="$2" v
+    v=$(sed -n "s/^$f: *//p" "$d/manifest.txt" 2>/dev/null | head -1)
+    if [ -z "$v" ] && [ "$f" = diskid ]; then
+        v=$(sed -n 's/^label-id: *0x0*//p' "$d/partition-table.sfdisk" 2>/dev/null | head -1)
+    fi
+    printf '%s' "$v"
+}
+
+cmd_backups() {
+    local d n=0
+    printf '  %s%-17s %-16s %-9s %6s  %-10s %s%s\n' "$c_dim" CREATED HOSTNAME DISK-ID SIZE STATUS DIRECTORY "$c_off"
+    for d in $(ls -1d "$BACKUP_ROOT"/*/ 2>/dev/null | sort -r); do
+        d="${d%/}"; [ -L "$d" ] && continue; [ -f "$d/manifest.txt" ] || continue
+        n=$((n+1))
+        printf '  %-17s %-16s %-9s %6s  %-10s %s\n' \
+            "$(bk_field "$d" created | sed 's/T/ /;s/:[0-9]*Z$//')" \
+            "$(bk_field "$d" hostname)" "$(bk_field "$d" diskid)" \
+            "$(du -sh "$d" | cut -f1)" "$(bk_field "$d" status | cut -d' ' -f1)" "$(basename "$d")"
+    done
+    [ "$n" -gt 0 ] || info "no backups in $BACKUP_ROOT"
+}
+
+# Accept a backup directory, its name, a hostname or a disk id; the latter
+# two pick the newest complete backup of that card.
+resolve_backup() {
+    local a="$1" d
+    [ -n "$a" ] || return 1
+    [ -d "$a" ] && { (cd "$a" && pwd); return 0; }
+    [ -d "$BACKUP_ROOT/$a" ] && { echo "$BACKUP_ROOT/$a"; return 0; }
+    for d in $(ls -1d "$BACKUP_ROOT"/*/ 2>/dev/null | sort -r); do
+        d="${d%/}"; [ -L "$d" ] && continue
+        grep -q '^status: *complete' "$d/manifest.txt" 2>/dev/null || continue
+        if [ "$(bk_field "$d" hostname)" = "$a" ] || [ "$(bk_field "$d" diskid)" = "${a#0x}" ]; then
+            echo "$d"; return 0
+        fi
+    done
+    return 1
+}
+
 cmd_restore() {
     local yes=0 args=() a
     for a in "$@"; do case "$a" in --yes|-y) yes=1 ;; *) args+=("$a") ;; esac; done
-    local src="${args[0]:-}" disk; disk=$(resolve_disk "${args[1]:-}")
-    [ -d "$src" ] || die "usage: $0 restore <backup-dir> [disk] [--yes]"
+    local src; src=$(resolve_backup "${args[0]:-}") \
+        || die "no backup matches '${args[0]:-}' - give a hostname, disk id or directory (see: $0 backups)"
+    local disk; disk=$(resolve_disk "${args[1]:-}")
+    info "restoring $(bk_field "$src" hostname) (card id $(bk_field "$src" diskid)) from $(basename "$src")"
     [ -f "$src/manifest.txt" ] || die "$src has no manifest.txt"
     grep -q '^status: *complete' "$src/manifest.txt" || die "that backup is not marked complete"
     case "$src" in "$BACKUP_ROOT"/*) ;; *) die "the backup must live under $BACKUP_ROOT (that is what the container can see)" ;; esac
@@ -945,7 +991,8 @@ sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
   $0 repair  <disk> [--force]  fsck with repairs (needs a backup first)
   $0 mount   <disk>            mount partitions read-only for browsing
   $0 shell   <disk> [--rw]     shell in the rescue container
-  $0 restore <backup-dir> [disk] [--yes]
+  $0 backups                   list backups: date, hostname, card id, size
+  $0 restore <hostname|id|dir> [disk] [--yes]
                                write a backup back to a card: verifies the backup,
                                recreates the partition table (same disk id), writes
                                every partition, then fscks and boot-checks the result
@@ -989,6 +1036,7 @@ case "${1:-}" in
     surface) shift; cmd_surface "$@" ;;
     health)  shift; cmd_health "$@" ;;
     list)    shift; cmd_list "$@" ;;
+    backups) shift; cmd_backups ;;
     info)    shift; cmd_info "$@" ;;
     check)   shift; cmd_check "$@" ;;
     backup)  shift; cmd_backup "$@" ;;

@@ -105,6 +105,7 @@ backup() {
         echo "created:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "device:    $NBD_DEV"
         echo "diskid:    $(sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed 's/^0x//')"
+        echo "hostname:  $(card_hostname)"
         echo "size:      $(blockdev --getsize64 "$NBD_DEV") bytes"
     } >> "$out/manifest.txt"
 
@@ -267,6 +268,7 @@ survey() {
 
     echo "disk.size=$(blockdev --getsize64 "$NBD_DEV" 2>/dev/null)"
     echo "disk.id=$(sfdisk --disk-id "$NBD_DEV" 2>/dev/null | sed 's/^0x//')"
+    echo "disk.host=$(card_hostname)"
     echo "disk.table=$(sfdisk -l "$NBD_DEV" 2>/dev/null | sed -n 's/^Disklabel type: //p')"
 
     for p in "${NBD_DEV}"p*; do
@@ -787,4 +789,22 @@ full_test() {
     echo "  FAIL  $n bad block(s): the card cannot store data reliably"
     head -20 "$out" | sed 's/^/        block /'
     return 1
+}
+
+# ------------------------------------------------------------- identity -----
+# The card's hostname, read from /etc/hostname on its root filesystem.
+# Read-only (noload), so it works on a card with an unreplayed journal.
+card_hostname() {
+    local p t h=""
+    for p in "${NBD_DEV}"p*; do
+        [ -b "$p" ] || continue
+        t=$(fstype_of "$p"); is_ext "$t" || continue
+        mkdir -p /mnt/hn
+        if mount -o ro,noload "$p" /mnt/hn 2>/dev/null; then
+            h=$(head -1 /mnt/hn/etc/hostname 2>/dev/null | tr -cd 'A-Za-z0-9.-')
+            umount /mnt/hn
+        fi
+        break
+    done
+    printf '%s' "$h"
 }
