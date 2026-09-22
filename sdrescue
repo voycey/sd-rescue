@@ -302,6 +302,10 @@ detach() {
     local do_eject=0
     [ "${1:-}" = "--eject" ] && [ "$NO_EJECT" != 1 ] && do_eject=1
     local disk; disk=$(cat "$DISKFILE" 2>/dev/null || true)
+    # Nothing attached but an eject asked for: eject the card in the reader.
+    if [ -z "$disk" ] && [ "$do_eject" = 1 ]; then
+        disk=$(find_sd_card 2>/dev/null) || disk=""
+    fi
 
     if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
         info "flushing and detaching $NBD_DEV"
