@@ -743,34 +743,41 @@ cmd_mount() {
 }
 
 cmd_restore() {
-    local src="${1:-}" disk; disk=$(resolve_disk "${2:-}")
-    [ -d "$src" ] || die "usage: $0 restore <backup-dir> <disk>"
+    local yes=0 args=() a
+    for a in "$@"; do case "$a" in --yes|-y) yes=1 ;; *) args+=("$a") ;; esac; done
+    local src="${args[0]:-}" disk; disk=$(resolve_disk "${args[1]:-}")
+    [ -d "$src" ] || die "usage: $0 restore <backup-dir> [disk] [--yes]"
     [ -f "$src/manifest.txt" ] || die "$src has no manifest.txt"
-    cat "$src/manifest.txt"
-    confirm "
+    grep -q '^status: *complete' "$src/manifest.txt" || die "that backup is not marked complete"
+    case "$src" in "$BACKUP_ROOT"/*) ;; *) die "the backup must live under $BACKUP_ROOT (that is what the container can see)" ;; esac
+
+    sed 's/^/  /' "$src/manifest.txt"
+    if [ "$yes" = 1 ]; then
+        warn "--yes given: overwriting /dev/$disk without the interactive confirmation"
+    else
+        confirm "
 ${c_red}This OVERWRITES /dev/$disk with the backup above. Everything on the card is lost.${c_off}" \
-        "restore $disk"
+            "restore $disk"
+    fi
+
     require_colima; trap cleanup_on_err EXIT
     attach "$disk" rw
-    local name; name=$(basename "$src")
-    rx "
-        set -e
-        cd /backup/$name
-        for f in *.pcl; do
-            [ -e \"\$f\" ] || continue
-            p=\${f%.pcl}
-            echo '>>> restoring' \$f '->' \$NBD_DEV\${p#nbd0}
-            partclone.extfs -r -s \"\$f\" -o /dev/\$p
-        done
-        for f in *.img; do
-            [ -e \"\$f\" ] || continue
-            p=\${f%.img}
-            echo '>>> restoring' \$f '->' /dev/\$p
-            dd if=\"\$f\" of=/dev/\$p bs=4M status=progress conv=fsync
-        done
-        sync"
+    set +e; rx "restore_backup /backup/$(basename "$src")"; local rc=$?; set -e
     trap - EXIT; detach
+    [ "$rc" -eq 0 ] || die "restore did not complete; the card may be in a partial state (the backup is untouched)"
     ok "restore complete"
+
+    # Prove what was written: fsck both filesystems and run the boot checks.
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    set +e
+    rx 'run_fsck check' 2>&1 | grep -E 'type=|exit=' || true
+    rx 'verify_boot'; local vrc=$?
+    set -e
+    trap - EXIT; detach --eject
+    [ "$vrc" -eq 0 ] && ok "restored card verifies clean and looks bootable" \
+                     || warn "restored card verified with problems (see above)"
+    return "$vrc"
 }
 
 usage() {
@@ -796,7 +803,10 @@ sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
   $0 repair  <disk> [--force]  fsck with repairs (needs a backup first)
   $0 mount   <disk>            mount partitions read-only for browsing
   $0 shell   <disk> [--rw]     shell in the rescue container
-  $0 restore <backup-dir> <disk>   write a backup back to a card
+  $0 restore <backup-dir> [disk] [--yes]
+                               write a backup back to a card: verifies the backup,
+                               recreates the partition table (same disk id), writes
+                               every partition, then fscks and boot-checks the result
   $0 detach                    tear down export + container
 
 Typical run for a Pi card that will not boot:

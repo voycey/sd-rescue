@@ -667,3 +667,50 @@ tidy_bootfs() {
     [ "$n" -gt 0 ] && echo "  removed $n macOS metadata item(s) from the boot partition"
     return 0
 }
+
+# -------------------------------------------------------------- restore -----
+# Write a backup back onto the card. Checks the backup first, recreates the
+# partition table from the saved dump (same disk id, so PARTUUIDs in
+# cmdline.txt and fstab still match), then writes each partition.
+restore_backup() {
+    local dir="$1" f p n
+    cd "$dir" || { echo "  err   no such backup: $dir"; return 1; }
+    grep -q '^status: *complete' manifest.txt 2>/dev/null || { echo "  err   backup is not marked complete"; return 1; }
+
+    echo "  checking the backup before touching the card"
+    if [ -f SHA256SUMS ]; then
+        sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1 && echo "  ok    checksums match" \
+            || { echo "  err   the backup files do not match their checksums; refusing to restore"; return 1; }
+    fi
+    for f in *.pcl; do
+        [ -e "$f" ] || continue
+        partclone.chkimg -s "$f" >/dev/null 2>&1 && echo "  ok    $f is a valid partclone image" \
+            || { echo "  err   $f fails partclone's image check; refusing to restore"; return 1; }
+    done
+    [ -s partition-table.sfdisk ] || { echo "  err   no partition table in the backup"; return 1; }
+
+    echo "  writing the partition table"
+    sfdisk --quiet --wipe always "$NBD_DEV" < partition-table.sfdisk || { echo "  err   sfdisk failed"; return 1; }
+    partprobe "$NBD_DEV" 2>/dev/null; sleep 1
+    for f in nbd0p*; do
+        [ -e "$f" ] || continue
+        n="${f%%.*}"; p="/dev/${n}"
+        [ -b "$p" ] || { echo "  err   $p did not appear after writing the partition table"; return 1; }
+    done
+
+    for f in *.img; do
+        [ -e "$f" ] || continue
+        n="${f%.img}"; p="/dev/$n"
+        echo "  writing $f -> $p (raw)"
+        dd if="$f" of="$p" bs=4M conv=fsync status=none || { echo "  err   dd failed on $p"; return 1; }
+    done
+    for f in *.pcl; do
+        [ -e "$f" ] || continue
+        n="${f%.pcl}"; p="/dev/$n"
+        echo "  writing $f -> $p (partclone, used blocks only)"
+        partclone.extfs -r -s "$f" -o "$p" -F -L /tmp/restore.log >/dev/null 2>&1 \
+            || { echo "  err   partclone restore failed on $p:"; tail -5 /tmp/restore.log; return 1; }
+    done
+    sync
+    echo "  ok    restore written and flushed"
+}
