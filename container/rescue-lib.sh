@@ -357,9 +357,11 @@ verify_boot() {
     [ -n "$rp" ] || { v_fail "no ext4 root partition found"; return 1; }
 
     mkdir -p "$boot" "$root"
-    mount -o ro "$bp" "$boot" 2>/dev/null || { v_fail "cannot mount $bp (boot)"; return 1; }
-    if ! mount -o ro "$rp" "$root" 2>/dev/null; then
-        v_fail "cannot mount $rp (root) - the kernel would fail here too"
+    local merr
+    merr=$(mount -o ro "$bp" "$boot" 2>&1) || { v_fail "cannot mount $bp (boot): $merr"; return 1; }
+    if ! merr=$(mount -o ro "$rp" "$root" 2>&1); then
+        v_fail "cannot mount $rp (root): $merr"
+        dmesg 2>/dev/null | grep -iE 'ext4|nbd0p2' | tail -3 | sed 's/^/        kernel: /'
         umount "$boot"; return 1
     fi
 
@@ -708,8 +710,19 @@ restore_backup() {
         [ -e "$f" ] || continue
         n="${f%.pcl}"; p="/dev/$n"
         echo "  writing $f -> $p (partclone, used blocks only)"
-        partclone.extfs -r -s "$f" -o "$p" -F -L /tmp/restore.log >/dev/null 2>&1 \
-            || { echo "  err   partclone restore failed on $p:"; tail -5 /tmp/restore.log; return 1; }
+        partclone.extfs -r -s "$f" -o "$p" -F -L "$dir/restore.partclone.log" >/dev/null 2>&1 \
+            || { echo "  err   partclone restore failed on $p:"; tail -5 "$dir/restore.partclone.log"; return 1; }
+        grep -E 'Total Time|successfully' "$dir/restore.partclone.log" | tail -2 | sed 's/^/        /'
+    done
+    sync
+    # The raw boot image carries whatever state it was captured in (macOS
+    # metadata, dirty bit); leave the card as a Pi would.
+    for f in *.img; do
+        [ -e "$f" ] || continue
+        n="${f%.img}"; p="/dev/$n"
+        [ "$(fstype_of "$p")" = vfat ] || continue
+        tidy_bootfs "$p"
+        fsck.fat -a -w "$p" >/dev/null 2>&1 || true
     done
     sync
     echo "  ok    restore written and flushed"
