@@ -602,6 +602,110 @@ cmd_surface() {
     return "$rc"
 }
 
+# Card identity from the SD card's CID register, as macOS reports it for the
+# built-in reader. USB readers do not pass the CID through.
+health_cid() {
+    local disk="$1" blk
+    blk=$(system_profiler SPCardReaderDataType 2>/dev/null | awk -v d="$disk" '
+        /SD[A-Z]* Card/ {b=""} {b=b"\n"$0} /BSD Name: /{ if ($NF==d) { print b; exit } }')
+    if [ -z "$blk" ]; then
+        info "card identity is not available through this reader (built-in reader only)"
+        return 0
+    fi
+    local f
+    for f in "Product Name" "Manufacturer ID" "Serial Number" "Manufacturing Date" "Capacity"; do
+        printf '        %-20s %s\n' "$f" "$(printf '%b' "$blk" | sed -n "s/^ *$f: //p" | head -1)"
+    done
+    case "$(printf '%b' "$blk" | sed -n 's/^ *Manufacturer ID: //p' | head -1)" in
+        0x1b) ok "manufacturer 0x1b is Samsung" ;; 0x03) ok "manufacturer 0x03 is SanDisk" ;;
+        0x74) ok "manufacturer 0x74 is Transcend" ;; 0x9f) ok "manufacturer 0x9f is Kingston/Longsys" ;;
+        0x00|"") warn "no manufacturer ID: typical of counterfeit cards" ;;
+        *) info "manufacturer ID not in this tool's short list; look it up before trusting the label" ;;
+    esac
+}
+
+# Full destructive test, then put the card back: needs a complete backup,
+# wipes and verifies every block, and restores the backup only if the card
+# passed.
+health_full() {
+    local disk="$1" yes="$2" id b rc
+    id=$(card_id "$disk"); b=$(latest_backup_for "$id")
+    if [ -z "$b" ] || ! grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null; then
+        info "no complete backup of this card yet - taking one first"
+        cmd_backup "$disk"
+        b=$(latest_backup_for "$id")
+        [ -n "$b" ] && grep -q '^status: *complete' "$b/manifest.txt" \
+            || die "backup did not complete - not wiping the card"
+    fi
+    info "backup to restore afterwards: $b"
+    ( cd "$b" && shasum -a 256 -c --quiet SHA256SUMS >/dev/null 2>&1 ) \
+        || die "that backup does not match its checksums - not wiping the card"
+    ok "backup checksums verified"
+
+    if [ "$yes" = 1 ]; then
+        warn "--yes given: wiping /dev/$disk without the interactive confirmation"
+    else
+        confirm "
+${c_red}The full test WIPES /dev/$disk: every block is overwritten with test data.${c_off}
+If the card passes, the backup above is restored onto it automatically.
+Expect several hours for a 256 GB card." "wipe $disk"
+    fi
+
+    trap cleanup_on_err EXIT
+    attach "$disk" rw
+    set +e; rx 'full_test'; rc=$?; set -e
+    if [ "$rc" != 0 ]; then
+        trap - EXIT; detach
+        warn "the card failed the full test; it has NOT been restored (it holds test data)"
+        warn "your data is safe in: $b"
+        return 1
+    fi
+
+    info "restoring the backup onto the tested card"
+    set +e; rx "restore_backup /backup/$(basename "$b")"; rc=$?; set -e
+    [ "$rc" = 0 ] || { trap - EXIT; detach; die "restore failed; the backup is untouched at $b"; }
+    info "checking the restored card"
+    set +e
+    rx 'run_fsck check' 2>&1 | grep -E 'type=|exit=' || true
+    rx 'verify_boot'; rc=$?
+    set -e
+    trap - EXIT; detach --eject
+    [ "$rc" = 0 ] && ok "card passed the full test and is restored, clean and bootable" \
+                  || warn "card passed the full test, but the restored image has problems (above)"
+    return "$rc"
+}
+
+cmd_health() {
+    local write=0 full=0 yes=0 args=() a
+    for a in "$@"; do case "$a" in
+        --write) write=1 ;; --full) full=1 ;; --yes|-y) yes=1 ;; *) args+=("$a") ;;
+    esac; done
+    local disk; disk=$(resolve_disk "${args[0]:-}")
+    info "card identity"
+    health_cid "$disk"
+    require_colima
+    if [ "$full" = 1 ]; then
+        health_full "$disk" "$yes"; return $?
+    fi
+    if [ "$write" = 1 ]; then
+        local id b; id=$(card_id "$disk"); b=$(latest_backup_for "$id")
+        [ -n "$b" ] && grep -q '^status: *complete' "$b/manifest.txt" 2>/dev/null \
+            || die "the write test writes to the card: back it up first ('$0 backup')"
+        info "backup kept at: $b"
+        trap cleanup_on_err EXIT
+        attach "$disk" rw
+        info "write test: fill the free space, read it back, compare (several hours on a big card)"
+        set +e; rx 'write_test'; local rc=$?; set -e
+    else
+        trap cleanup_on_err EXIT
+        attach "$disk" ro
+        info "read test: every sector once (read-only; a 256 GB card takes a few hours)"
+        set +e; rx 'surface /backup/surface-last.map'; local rc=$?; set -e
+    fi
+    trap - EXIT; detach
+    return "$rc"
+}
+
 cmd_verify() {
     local deep="" args=() a
     for a in "$@"; do case "$a" in --deep) deep=deep ;; *) args+=("$a") ;; esac; done
@@ -824,6 +928,12 @@ sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
   $0 list                      show removable disks
   $0 info    <disk>            partition table + filesystem state (read-only)
   $0 check   <disk>            fsck in read-only mode, reports what is wrong
+  $0 health  [disk] [--write|--full]
+                               card identity, then a full read test.
+                               --write fills the free space and verifies every
+                               byte (keeps your data). --full WIPES the card,
+                               writes and verifies every block, then restores
+                               its backup if it passed (hours; backs up first)
   $0 surface <disk>            read every sector once, report unreadable ones
   $0 verify  <disk> [--deep]   boot-readiness: cmdline/fstab PARTUUIDs, kernel
                                vs modules, dpkg state, NUL-filled configs,
@@ -875,6 +985,7 @@ case "${1:-}" in
     fix)     shift; cmd_fix "$@" ;;
     verify)  shift; cmd_verify "$@" ;;
     surface) shift; cmd_surface "$@" ;;
+    health)  shift; cmd_health "$@" ;;
     list)    shift; cmd_list "$@" ;;
     info)    shift; cmd_info "$@" ;;
     check)   shift; cmd_check "$@" ;;

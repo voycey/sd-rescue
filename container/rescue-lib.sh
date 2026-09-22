@@ -727,3 +727,52 @@ restore_backup() {
     sync
     echo "  ok    restore written and flushed"
 }
+
+# --------------------------------------------------------------- health -----
+# Fill the free space of the root filesystem with f3's test pattern, read it
+# all back and compare. Existing files are untouched; the test files are
+# deleted afterwards. Mounting read-write replays a pending journal.
+write_test() {
+    local rp="" p t m=/mnt/health dir out
+    for p in "${NBD_DEV}"p*; do
+        [ -b "$p" ] || continue
+        t=$(fstype_of "$p"); is_ext "$t" && { rp="$p"; break; }
+    done
+    [ -n "$rp" ] || { echo "  err   no ext4 partition to test"; return 1; }
+    mkdir -p "$m"
+    mount "$rp" "$m" || { echo "  err   cannot mount $rp read-write"; return 1; }
+    dir="$m/.sdrescue-health"; rm -rf "$dir"; mkdir -p "$dir"
+    echo "  writing test data into $(df -h --output=avail "$m" | tail -1 | tr -d ' ') of free space"
+    f3write "$dir" 2>&1 | tr '\b\r' '\n\n' | grep -E 'Free space|Average writing|Creating file' | tail -2 | sed 's/^/        /'
+    echo "  reading it back and comparing"
+    out=$(f3read "$dir" 2>&1 | tr '\b\r' '\n\n')
+    rm -rf "$dir"; sync; umount "$m"
+    printf '%s\n' "$out" | grep -E 'Data OK|Data LOST|Corrupted|Slightly changed|Overwritten|Average reading' | sed 's/^ */        /'
+    if printf '%s\n' "$out" | grep -qE 'Data LOST: *0\.00 Byte'; then
+        echo "  ok    every byte written came back intact"
+        return 0
+    fi
+    echo "  FAIL  the card lost or changed data: the flash is not storing reliably"
+    return 1
+}
+
+# Destructive full-surface test: write a random pattern to every block of the
+# whole card, then read every block back and compare (badblocks -w, one
+# pattern). This also gives the card's controller a fresh write to every
+# block, which is what clears a mapping state left by a power cut.
+full_test() {
+    local out=/tmp/badblocks.txt n t0 t1
+    echo "  writing and verifying all $(( $(blockdev --getsize64 "$NBD_DEV") / 1024 / 1024 / 1024 )) GiB of $NBD_DEV"
+    t0=$(date +%s)
+    badblocks -w -s -v -t random -b 4096 -c 4096 -o "$out" "$NBD_DEV"
+    t1=$(date +%s)
+    n=$(grep -c . "$out" 2>/dev/null)
+    echo "        took $(( (t1 - t0) / 60 )) minutes"
+    if [ "${n:-0}" -eq 0 ]; then
+        echo "  ok    every block written and read back correctly: the flash is healthy"
+        return 0
+    fi
+    echo "  FAIL  $n bad block(s): the card cannot store data reliably"
+    head -20 "$out" | sed 's/^/        block /'
+    return 1
+}
