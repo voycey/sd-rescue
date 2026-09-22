@@ -572,6 +572,16 @@ cmd_main() {
     esac
 }
 
+cmd_surface() {
+    local disk; disk=$(resolve_disk "${1:-}")
+    require_colima; trap cleanup_on_err EXIT
+    attach "$disk" ro
+    info "full-surface read test (read-only; a 256 GB card takes an hour or two)"
+    set +e; rx 'surface /backup/surface-last.map'; local rc=$?; set -e
+    trap - EXIT; detach
+    return "$rc"
+}
+
 cmd_verify() {
     local deep="" args=() a
     for a in "$@"; do case "$a" in --deep) deep=deep ;; *) args+=("$a") ;; esac; done
@@ -777,6 +787,7 @@ sdrescue $VERSION - repair Raspberry Pi SD cards from macOS via colima
   $0 list                      show removable disks
   $0 info    <disk>            partition table + filesystem state (read-only)
   $0 check   <disk>            fsck in read-only mode, reports what is wrong
+  $0 surface <disk>            read every sector once, report unreadable ones
   $0 verify  <disk> [--deep]   boot-readiness: cmdline/fstab PARTUUIDs, kernel
                                vs modules, dpkg state, NUL-filled configs,
                                SSH host keys, lost+found. --deep also checks
@@ -807,6 +818,7 @@ require_tools
 case "${1:-}" in
     fix)     shift; cmd_fix "$@" ;;
     verify)  shift; cmd_verify "$@" ;;
+    surface) shift; cmd_surface "$@" ;;
     list)    shift; cmd_list "$@" ;;
     info)    shift; cmd_info "$@" ;;
     check)   shift; cmd_check "$@" ;;

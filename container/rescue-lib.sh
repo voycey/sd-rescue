@@ -197,6 +197,9 @@ run_fsck() {
             if [ "$mode" = check ]; then
                 fsck.fat -n -v "$p"
             else
+                tidy_bootfs "$p"
+                # -a repairs, -w writes changes at once; this also clears the
+                # dirty bit macOS leaves behind.
                 fsck.fat -a -w -v "$p"
             fi
         else
@@ -624,4 +627,43 @@ _verify_checks() {
     if [ "$nmiss" -gt 0 ] || [ "$nsys" -gt 0 ]; then
         echo "        reinstall the owning packages on the Pi: dpkg -S <file> ; apt reinstall <pkg>"
     fi
+}
+
+# -------------------------------------------------------------- surface -----
+# Read every sector of the card once. A card whose flash is failing often
+# reads its used blocks fine and still throws errors or stalls elsewhere;
+# this is the closest an SD reader gets to the Pi's opinion of the card.
+# Read-only. Bad sectors are listed in the mapfile ddrescue keeps.
+surface() {
+    local map="${1:-/tmp/surface.map}" size
+    size=$(blockdev --getsize64 "$NBD_DEV")
+    echo "  reading all $(( size / 1024 / 1024 / 1024 )) GiB of $NBD_DEV once, read-only"
+    rm -f "$map"
+    ddrescue -f -n -b 4096 "$NBD_DEV" /dev/null "$map" 2>&1 | tr '\r' '\n' | grep -E 'rescued:|error|bad' | tail -3
+    local bad
+    bad=$(grep -cE '^0x[0-9A-Fa-f]+ +0x[0-9A-Fa-f]+ +[-*/]' "$map" 2>/dev/null)
+    if [ "${bad:-0}" -eq 0 ]; then
+        echo "  ok    every sector read back without error"
+        return 0
+    fi
+    echo "  FAIL  $bad unreadable region(s):"
+    grep -E '^0x[0-9A-Fa-f]+ +0x[0-9A-Fa-f]+ +[-*/]' "$map" | awk '{printf "        at %d MiB, %d KiB\n", strtonum($1)/1048576, strtonum($2)/1024}' | head -20
+    return 1
+}
+
+# macOS drops Spotlight and fsevents metadata on any FAT volume it mounts and
+# leaves the dirty bit set behind a forced unmount. Neither belongs on a Pi
+# boot partition. Called from the repair pass, which already has the card
+# read-write.
+tidy_bootfs() {
+    local p="$1" m=/mnt/tidy n=0 f
+    mkdir -p "$m"
+    mount "$p" "$m" 2>/dev/null || return 0
+    for f in "$m"/.Spotlight-V100 "$m"/.fseventsd "$m"/.Trashes "$m"/.TemporaryItems "$m"/.DS_Store "$m"/._*; do
+        [ -e "$f" ] || continue
+        rm -rf "$f" && n=$((n+1))
+    done
+    umount "$m"
+    [ "$n" -gt 0 ] && echo "  removed $n macOS metadata item(s) from the boot partition"
+    return 0
 }
